@@ -1,0 +1,51 @@
+# Dependencies
+
+node_modules/
+**/node_modules/
+
+# Environment variables / secrets
+
+.env
+.env.*
+!.env.example
+
+# Netlify
+
+.netlify/
+
+# Logs
+
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Build / generated files
+
+dist/
+build/
+coverage/
+
+# OS files
+
+.DS_Store
+Thumbs.db
+
+# IDE / editor
+
+.vscode/
+.idea/
+
+# Temporary files
+
+*.tmp
+*.temp
+*.cache
+
+# Local configuration / secrets
+
+*.pem
+*.key
+secrets/
+credentials/

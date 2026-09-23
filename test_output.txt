@@ -1,0 +1,16 @@
+=================================
+Allowed CORS Origins:
+[
+  'http://localhost:5173',
+  'https://a1-fitness-alpha.vercel.app',
+  'http://localhost:5174',
+  'http://localhost:3000'
+]
+=================================
+Environment: development
+RENDER: false
+MongoDB connected
+Database connection successful
+Default Admin already exists.
+Server running on port 5000
+Server running on port 5001
