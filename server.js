@@ -40,8 +40,8 @@ const { initRealtime } = require("./services/realtime.service");
 // ============================================================
 
 const app = express();
-// Trust proxy headers sent by Render's load balancers
-app.enable('trust proxy');
+// Trust exactly 1 hop (Render load balancer) to fix ERR_ERL_PERMISSIVE_TRUST_PROXY
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 
 // ============================================================
