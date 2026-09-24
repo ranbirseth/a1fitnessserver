@@ -796,9 +796,11 @@ const history = asyncHandler(async (req, res) => {
 
   if (search) {
     const members = await Member.aggregate([
+      { $match: { gymId: req.gymId } },
       { $lookup: { from: "users", localField: "user", foreignField: "_id", as: "userDoc" } },
       { $unwind: "$userDoc" },
-      { $match: { "userDoc.name": new RegExp(search, "i") } }
+      { $match: { "userDoc.name": new RegExp(search, "i") } },
+      { $project: { _id: 1 } }
     ]);
     const searchMemberIds = members.map(m => m._id);
     scopeConditions.push({ member: { $in: searchMemberIds } });
@@ -813,6 +815,7 @@ const history = asyncHandler(async (req, res) => {
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
+      .lean()
       .populate({
         path: "member",
         populate: { path: "user", select: "name email phone" }

@@ -51,6 +51,8 @@ const attendanceSchema = new mongoose.Schema(
 );
 
 attendanceSchema.index({ gymId: 1, member: 1, date: 1 }, { unique: true });
+attendanceSchema.index({ gymId: 1, branchCode: 1, date: -1 });
+attendanceSchema.index({ branchCode: 1, date: -1 });
 attendanceSchema.index({ member: 1, date: -1 });
 attendanceSchema.index({ status: 1, date: 1 });
 attendanceSchema.index({ deletedAt: 1 });

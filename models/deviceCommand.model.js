@@ -1,6 +1,6 @@
 const mongoose = require("mongoose");
 
-const DEVICE_COMMAND_STATUSES = ["pending", "sent", "executed", "failed"];
+const DEVICE_COMMAND_STATUSES = ["pending", "sent", "executed", "failed", "ignored"];
 
 const deviceCommandSchema = new mongoose.Schema(
   {

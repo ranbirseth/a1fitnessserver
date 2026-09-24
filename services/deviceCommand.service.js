@@ -44,7 +44,12 @@ async function acknowledgeCommand({ serialNumber, commandId, returnCode, rawBody
   const command = await DeviceCommand.findOne(query);
   if (!command) return null;
 
-  command.status = String(returnCode) === "0" ? "executed" : "failed";
+  const normalizedReturnCode = String(returnCode || "").trim();
+  command.status = normalizedReturnCode === "0"
+    ? "executed"
+    : normalizedReturnCode === "-1004"
+      ? "ignored"
+      : "failed";
   if (rawBody !== undefined) command.responseRaw = String(rawBody).slice(0, 2000);
   await command.save();
   return command;
