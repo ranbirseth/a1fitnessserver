@@ -77,7 +77,8 @@ async function handleGetRequest(req, res, url) {
     console.error(`[adms] getrequest queue error for ${scanner.serial}:`, err && err.message ? err.message : err);
   }
 
-  sendText(res, 200, buildGetRequestResponse(command));
+  if (!command) return sendText(res, 200, "OK");
+  return sendText(res, 200, buildGetRequestResponse(command));
 }
 
 async function handleCdata(req, res, url, body) {
@@ -121,7 +122,10 @@ async function handleCdata(req, res, url, body) {
       }
     }
 
-    sendText(res, 200, buildCdataResponse(results));
+    // eSSL/ZKTeco firmware expects the standard plain-text ack for ATTLOG
+    // pushes. Anything else (e.g. "OK: N" or JSON) surfaces as error -1004 on
+    // the device. sendText sets Content-Type: text/plain before ending.
+    sendText(res, 200, "OK\n");
     return;
   }
 
@@ -154,7 +158,7 @@ async function handleDeviceCmd(req, res, url, body) {
     console.error(`[adms] devicecmd acknowledge error:`, err && err.message ? err.message : err);
   }
 
-  sendText(res, 200, "OK");
+  return sendText(res, 200, "OK");
 }
 
 module.exports = { handleGetRequest, handleCdata, handleDeviceCmd, extractSerial, resolveScanner };

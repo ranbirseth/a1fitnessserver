@@ -534,6 +534,28 @@ if (process.env.RENDER !== "true") {
   // streams reach req.body as untouched strings.
   admsApp.use(express.text({ type: "*/*", limit: "5mb" }));
 
+  // Global debug middleware for diagnosing biometric machine transmissions
+  admsApp.use((req, res, next) => {
+    // 1. Silent short-circuit filter to eliminate mobile tablet socket spam
+    if (req.url.startsWith('/message')) {
+      res.header('Connection', 'close');
+      return res.status(404).end();
+    }
+
+    // 2. Standard operational biometric logging (Only fires for actual machine data)
+    console.log(`\n=================================`);
+    console.log(`[ADMS RAW REQUEST] ${req.method} ${req.url}`);
+    console.log(`Headers:`, req.headers);
+    if (req.query && Object.keys(req.query).length) {
+      console.log("Query Params:", req.query);
+    }
+    if (req.body && Object.keys(req.body).length) {
+      console.log("Body Payload:", req.body);
+    }
+    console.log(`=================================\n`);
+    next();
+  });
+
   // Route all incoming /iclock paths to the ADMS router endpoints.
   admsApp.use("/iclock", require("./routes/adms.routes"));
 
