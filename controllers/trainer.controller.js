@@ -27,28 +27,64 @@ const listTrainers = asyncHandler(async (req, res) => {
   sendResponse(res, { message: "Trainers fetched", data: { items, total, page, limit } });
 });
 
+// Trainer profile creation.
+// A Trainer is a branch-assigned PROFILE, not an account: name, phone,
+// specialty and branch are what matter. Email and password are therefore
+// OPTIONAL and are never auto-generated - a Trainer cannot sign in (see
+// auth.controller.js `login`), so handing out default credentials would only
+// create a fake login that must never work.
 const createTrainer = asyncHandler(async (req, res) => {
-  const { name, email, phone, password, specialty, status, branchCode = "MAIN" } = req.body;
-  
+  const { name, email, phone, password, specialty, status, branchCode } = req.body;
+
+  const trimmedName = name ? String(name).trim() : "";
+  const trimmedPhone = phone ? String(phone).trim() : "";
+  const trimmedSpecialty = specialty ? String(specialty).trim() : "";
+  const normalizedEmail = email ? String(email).toLowerCase().trim() : "";
+
+  const validation = {};
+  if (!trimmedName) validation.name = "Trainer name is required.";
+  if (!trimmedPhone) {
+    validation.phone = "Phone number is required.";
+  } else if (trimmedPhone.replace(/\D/g, "").length < 10) {
+    validation.phone = "Enter a valid phone number.";
+  }
+  if (!trimmedSpecialty) validation.specialty = "Specialty is required.";
+  if (Object.keys(validation).length > 0) {
+    throw Object.assign(new Error(Object.values(validation)[0]), {
+      statusCode: 400,
+      details: validation
+    });
+  }
+
+  // Branch isolation (server-enforced, never trusted from the client):
+  // superadmin may target any branch; a branch admin is always forced to their
+  // own branchCode regardless of what they send.
   const scopedBranchCode = req.user.role === "superadmin"
     ? (branchCode || "MAIN").trim().toUpperCase()
     : (req.user.branchCode || "MAIN").trim().toUpperCase();
 
-  const existing = await User.findOne({ gymId: req.gymId, email: email?.toLowerCase().trim() });
-  if (existing) {
-    throw Object.assign(new Error("A user with this email already exists in this gym"), { statusCode: 409 });
+  // Only meaningful when an email is actually supplied; trainers are allowed to
+  // exist without one. The uniqueness query MUST stay inside this guard: with
+  // no email the value would be `undefined`, Mongoose strips it from the
+  // filter and the lookup silently degrades to a gym-wide match, rejecting
+  // every trainer creation with 409.
+  if (normalizedEmail) {
+    const existing = await User.findOne({ gymId: req.gymId, email: normalizedEmail });
+    if (existing) {
+      throw Object.assign(new Error("A user with this email already exists in this gym"), { statusCode: 409 });
+    }
   }
 
   const trainer = await User.create({
     gymId: req.gymId,
-    name,
-    email: email?.toLowerCase().trim(),
-    phone,
-    password: password || "Password123",
+    name: trimmedName,
+    phone: trimmedPhone,
     role: "trainer",
-    specialty,
+    specialty: trimmedSpecialty,
     status: status || "active",
-    branchCode: scopedBranchCode
+    branchCode: scopedBranchCode,
+    ...(normalizedEmail ? { email: normalizedEmail } : {}),
+    ...(password ? { password } : {})
   });
 
   sendResponse(res, {
@@ -57,7 +93,6 @@ const createTrainer = asyncHandler(async (req, res) => {
     data: {
       _id: trainer._id,
       name: trainer.name,
-      email: trainer.email,
       phone: trainer.phone,
       role: trainer.role,
       specialty: trainer.specialty,

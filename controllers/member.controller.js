@@ -665,7 +665,14 @@ const updateMember = asyncHandler(async (req, res) => {
     }
 
     if (trainerId !== undefined) {
-      member.trainer = await resolveValidTrainer(trainerId, member.branchCode, req.gymId);
+      // Validate the trainer against the branch the member will END UP in, not
+      // the current one: a superadmin may move a member to another branch and
+      // pick that branch's trainer in the same request. Branch isolation is
+      // still fully enforced - the trainer must belong to the resulting branch.
+      const targetBranchCode = (memberPayload.branchCode || member.branchCode || "MAIN")
+        .trim()
+        .toUpperCase();
+      member.trainer = await resolveValidTrainer(trainerId, targetBranchCode, req.gymId);
     }
 
     Object.assign(member, memberPayload);

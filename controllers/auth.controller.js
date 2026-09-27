@@ -124,7 +124,24 @@ const login = asyncHandler(async (req, res) => {
   if (role) query.role = role;
 
   const user = await User.findOne(query);
-  if (!user || !(await user.comparePassword(password))) {
+  if (!user) {
+    throw new AppError("Invalid credentials", 401, "INVALID_CREDENTIALS");
+  }
+
+  // Trainers are branch-assigned PROFILES, not application users: they have no
+  // email/password and must never obtain a session. Checked BEFORE the password
+  // comparison so a credential-less trainer profile can never be used to
+  // authenticate through the generic login endpoint. Admin/superadmin/member
+  // authentication is completely unaffected.
+  if (user.role === "trainer") {
+    throw new AppError(
+      "Trainer accounts cannot sign in to the application.",
+      403,
+      "TRAINER_LOGIN_NOT_ALLOWED"
+    );
+  }
+
+  if (!(await user.comparePassword(password))) {
     throw new AppError("Invalid credentials", 401, "INVALID_CREDENTIALS");
   }
 
