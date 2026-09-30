@@ -151,6 +151,23 @@ app.use(
 app.use("/iclock", express.text({ type: "*/*", limit: "5mb" }));
 app.use("/iclock", require("./routes/adms.routes"));
 
+// ============================================================
+// FKWEB DEVICE PUSH MIDDLEWARE (realtime Biometric RS9n)
+// ============================================================
+// Registered BEFORE the global JSON parser, for the same ordering reason as
+// /iclock above: the FkWeb parser must win the body-handling race. The RS9n
+// transmits an absolute-form request target ("POST http://<server>/ HTTP/1.0"),
+// which Node preserves in req.url but resolves to req.path === "/", so the
+// device can never be given a URL path. The ingest point is therefore POST "/".
+// POST "/fkweb" is mounted as an equivalent alias so the endpoint can be reached
+// explicitly by tooling and by local tests.
+//
+// This is purely additive: the /iclock block above is untouched, and the scope is
+// POST-only, so no existing route's body parsing, ordering or response changes.
+const fkwebRoutes = require("./routes/fkweb.routes");
+app.post("/", fkwebRoutes);
+app.post("/fkweb", fkwebRoutes);
+
 app.use(
   express.json({
     limit: "1mb",
@@ -169,11 +186,22 @@ app.use(morgan("dev"));
 // throttled as DDoS traffic. These path prefixes are the explicit whitelist.
 const RATE_LIMIT_BYPASS_PREFIXES = ["/api/scanners", "/iclock"];
 
+// The RS9n replays its buffered attendance history the moment it connects, so a
+// history drain can legitimately exceed the API limit within a single window and
+// a 429 would push the device into a retry storm. It posts to the absolute-form
+// root path, which matches no prefix above, so it needs its own guard. This is
+// deliberately exact (POST plus exact path) so GET / and every /api route stay
+// rate limited.
+const isFkWebDevicePush = (req) =>
+  req.method === "POST" && (req.path === "/" || req.path === "/fkweb");
+
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 300,
-    skip: (req) => RATE_LIMIT_BYPASS_PREFIXES.some((prefix) => req.path.startsWith(prefix)),
+    skip: (req) =>
+      RATE_LIMIT_BYPASS_PREFIXES.some((prefix) => req.path.startsWith(prefix)) ||
+      isFkWebDevicePush(req)
   })
 );
 
