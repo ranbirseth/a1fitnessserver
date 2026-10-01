@@ -4,11 +4,21 @@
 // ATTENDANCE INGESTION ONLY.
 //
 // request_code routing:
-//   realtime_glog         -> the only type that reaches processScannerEvent()
+//   realtime_glog         -> the only type that reaches processScannerEvent(), and
+//                            only after the historical-log cutoff accepts it
 //   realtime_enroll_data  -> ACK, nothing persisted, no template storage
 //   receive_cmd           -> ACK, nothing persisted, no device commands issued
 //   send_cmd_result       -> ACK, nothing persisted
 //   anything else         -> ACK + warn log
+//
+// HISTORICAL-LOG CUTOFF
+// The device holds ~9,293 buffered Time Logs and replays them on connect. A
+// realtime_glog record may only reach the attendance pipeline if its device
+// io_time is at or after the registered Scanner's fkwebAcceptAfter; otherwise it
+// is ACKed and dropped. The same ACK is returned either way, because a non-2xx
+// would make the device retry a backlog record that must never succeed.
+// Activation is a separate, explicit admin operation (scanner.controller.js), so
+// a registered-but-not-activated RS9n ingests nothing.
 //
 // ACK CONTRACT (do not change without testing against the physical device):
 // The RS9n was verified against a temporary local receiver that answered
@@ -33,7 +43,8 @@ const { findScannerByDevId } = require("../services/fkwebDeviceLookup");
 const {
   readFkWebRequestMeta,
   extractJsonObject,
-  toFkWebScannerEvent
+  toFkWebScannerEvent,
+  evaluateFkWebCutoff
 } = require("../utils/fkwebParser");
 
 const ACK_HEADERS = {
@@ -100,6 +111,32 @@ async function touchScanner(scanner) {
   }
 }
 
+// A backlog drain is one line per record and can be ~9,293 records long, so
+// ignored-record reporting is aggregated per scanner and reason: the first one
+// is reported in full, then at most once per throttle window with the running
+// total. The message text is identical either way so a single grep still finds
+// every backlog, and the counter makes the size of a drain visible.
+const ignoredReportState = new Map();
+
+function reportIgnoredRecord(scanner, { reason, userId, eventTime, cutoff }) {
+  const serial = (scanner && scanner.serial) || (scanner && scanner.deviceId) || "-";
+  const key = `${scanner && scanner._id}:${reason}`;
+  const state = ignoredReportState.get(key) || { count: 0, lastReportedAt: 0 };
+  state.count += 1;
+
+  const now = Date.now();
+  if (state.count === 1 || now - state.lastReportedAt >= SCANNER_TOUCH_THROTTLE_MS) {
+    state.lastReportedAt = now;
+    warn(
+      `[FKWEB] historical event ignored scanner=${serial} user_id=${userId || "-"} ` +
+      `event_time=${eventTime ? eventTime.toISOString() : "-"} ` +
+      `cutoff=${cutoff ? cutoff.toISOString() : "not_activated"} ` +
+      `reason=${reason} ignored_total=${state.count}`
+    );
+  }
+  ignoredReportState.set(key, state);
+}
+
 async function handleRealtimeGlog({ res, scanner, body, meta }) {
   const envelope = extractJsonObject(body);
 
@@ -115,6 +152,25 @@ async function handleRealtimeGlog({ res, scanner, body, meta }) {
   }
 
   const { event, ioMode, verifyMode } = built;
+
+  // The historical-log cutoff. This is the last gate before the shared pipeline:
+  // a backlogged record stops here, so no Attendance, no ScannerEvent and no
+  // processScannerEvent() call can result from it. The comparison uses the
+  // device's own io_time, never the HTTP arrival time. Only scanner identity,
+  // status and user/event identifiers are logged - never the fingerprint payload.
+  const cutoff = evaluateFkWebCutoff({ scanner, timestamp: event.timestamp });
+  if (!cutoff.allow) {
+    reportIgnoredRecord(scanner, {
+      reason: cutoff.reason,
+      userId: event.rawUserId,
+      eventTime: cutoff.eventTime,
+      cutoff: cutoff.cutoff
+    });
+    // Liveness is tracked even for backlog so the device still reads as online,
+    // but this is deliberately the only side effect: no attendance is touched.
+    await touchScanner(scanner);
+    return sendFkWebAck(res);
+  }
 
   log(`[FKWEB] request_code=realtime_glog dev_id=${meta.devId} user_id=${event.rawUserId} io_mode=${ioMode} verify_mode=${verifyMode} trans_id=${meta.transId || "-"}`);
 

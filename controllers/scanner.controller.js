@@ -5,6 +5,7 @@ const { sendResponse } = require("../utils/response");
 const { AppError } = require("../utils/appError");
 const { enforceBranchOwnership } = require("../middlewares/branchScope.middleware");
 const { hashKey, generateKey } = require("../utils/deviceKey");
+const { parseFkWebAcceptAfter, isFkWebCapableScanner } = require("../utils/fkwebParser");
 
 const findScannedById = async (req) => {
   const scanner = await Scanner.findOne({ _id: req.params.id, gymId: req.gymId });
@@ -56,6 +57,11 @@ const createScanner = asyncHandler(async (req, res) => {
   delete body.apiKeyHash;
   delete body.gymId;
   delete body.branchCode;
+  // Registration and activation are deliberately separate operations. Dropping
+  // this here means the cutoff can only ever be set through the explicit
+  // activation endpoint below, so a scanner document can never acquire an
+  // acceptance boundary by accident (or as a side effect of a stale admin UI).
+  delete body.fkwebAcceptAfter;
 
   const scanner = await Scanner.create({
     gymId: req.gymId,
@@ -117,6 +123,80 @@ const rotateScannerKey = asyncHandler(async (req, res) => {
   sendResponse(res, {
     message: "Scanner API key rotated. Configure the device with the new key.",
     data: { apiKey }
+  });
+});
+
+/**
+ * Explicitly sets the RS9n historical-log cutoff (Scanner.fkwebAcceptAfter).
+ *
+ * The RS9n replays its buffered Time Logs as soon as it is pointed at an FkWeb
+ * endpoint, so activation is an operator decision made against a known boundary
+ * and never a side effect of registration. Until this runs, fkwebAcceptAfter is
+ * null and every realtime_glog record is ACKed and ignored.
+ *
+ * `acceptAfter` is REQUIRED and is never defaulted to the current time: an
+ * implicit "now" would silently accept the very backlog this exists to exclude.
+ * Accepted forms are an ISO-8601 instant with an offset/Z, a bare wall-clock
+ * reading interpreted in the scanner's deviceTimezone, or the device's compact
+ * 14-digit form. Passing an explicit null clears the cutoff and returns the
+ * scanner to the ignore-everything safety state.
+ */
+const activateFkwebCutoff = asyncHandler(async (req, res) => {
+  assertAdminWrite(req);
+
+  const scanner = await findScannedById(req);
+
+  if (!isFkWebCapableScanner(scanner)) {
+    throw new AppError("This operation only applies to FkWeb / RS9n scanners", 400);
+  }
+
+  const body = req.body || {};
+  if (!Object.prototype.hasOwnProperty.call(body, "acceptAfter")) {
+    throw new AppError("acceptAfter is required: supply the activation timestamp explicitly", 400);
+  }
+
+  const serial = scanner.serial || scanner.deviceId;
+  const timezone = scanner.deviceTimezone;
+
+  if (body.acceptAfter === null) {
+    scanner.fkwebAcceptAfter = null;
+    await scanner.save();
+    console.log(
+      `[scanner] fkweb cutoff CLEARED scanner=${scanner._id} serial=${serial} by=${req.user._id || "-"}`
+    );
+    sendResponse(res, {
+      message: "FkWeb cutoff cleared. RS9n realtime_glog records are ACKed and ignored again.",
+      data: { scanner: scanner._id, serial, branchCode: scanner.branchCode, fkwebAcceptAfter: null, timezone }
+    });
+    return;
+  }
+
+  const acceptAfter = parseFkWebAcceptAfter(body.acceptAfter, timezone);
+  if (!acceptAfter) {
+    throw new AppError(
+      "acceptAfter is not a valid timestamp. Use an ISO-8601 instant with an offset, a wall-clock reading such as 2026-10-01T12:00:00, or the device format 20261001120000.",
+      400
+    );
+  }
+
+  scanner.fkwebAcceptAfter = acceptAfter;
+  await scanner.save();
+
+  console.log(
+    `[scanner] fkweb cutoff SET scanner=${scanner._id} serial=${serial} ` +
+    `branch=${scanner.branchCode} fkwebAcceptAfter=${acceptAfter.toISOString()} timezone=${timezone} by=${req.user._id || "-"}`
+  );
+
+  sendResponse(res, {
+    message:
+      "FkWeb cutoff activated. realtime_glog records before this timestamp are ACKed and ignored; at or after it they are processed normally.",
+    data: {
+      scanner: scanner._id,
+      serial,
+      branchCode: scanner.branchCode,
+      fkwebAcceptAfter: acceptAfter.toISOString(),
+      timezone
+    }
   });
 });
 
@@ -182,6 +262,7 @@ module.exports = {
   updateScanner,
   deleteScanner,
   rotateScannerKey,
+  activateFkwebCutoff,
   getSyncPayload,
   pingScanner
 };

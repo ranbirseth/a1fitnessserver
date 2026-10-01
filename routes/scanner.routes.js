@@ -9,6 +9,7 @@ const {
   updateScanner,
   deleteScanner,
   rotateScannerKey,
+  activateFkwebCutoff,
   getSyncPayload,
   pingScanner
 } = require("../controllers/scanner.controller");
@@ -26,6 +27,11 @@ router.post("/", protect, adminOnly, createScanner);
 router.patch("/:id", protect, adminOnly, updateScanner);
 router.delete("/:id", protect, adminOnly, deleteScanner);
 router.post("/:id/rotate-key", protect, adminOnly, rotateScannerKey);
+// Sets the RS9n historical-log cutoff (Scanner.fkwebAcceptAfter). Behind the
+// same authenticated branch-admin guard as every other scanner mutation: an
+// unauthenticated caller can never move the attendance boundary. An explicit
+// timestamp is required, so activation is always an auditable operator action.
+router.post("/:id/fkweb-activate", protect, adminOnly, activateFkwebCutoff);
 router.get("/:id/sync-payload", protect, adminOnly, getSyncPayload);
 router.post("/:id/ping", protect, authorize("admin", "superadmin"), pingScanner);
 

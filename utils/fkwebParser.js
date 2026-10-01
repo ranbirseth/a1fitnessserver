@@ -14,6 +14,17 @@
 //   RS9n : HTTP/1.0 absolute-form POST, JSON envelope + optional binary tail,
 //          compact YYYYMMDDHHMMSS timestamps
 // The two parsers are intentionally NOT merged.
+//
+// HISTORICAL-LOG CUTOFF
+// The physical RS9n holds ~9,293 buffered Time Logs and replays them the moment
+// it is pointed at an FkWeb endpoint. Those records must never become
+// attendance, so every realtime_glog record is gated on Scanner.fkwebAcceptAfter
+// before it reaches the shared pipeline. evaluateFkWebCutoff() is that gate, and
+// it is a pure predicate: it decides "new or backlog", nothing else. Attendance
+// rules stay in processScannerEvent(), which remains the only place attendance is
+// ever created. parseFkWebAcceptAfter() is the operator-facing half: it turns an
+// explicitly supplied activation timestamp into an instant using the same
+// Asia/Kolkata-by-default convention as the device-side io_time.
 // ============================================================
 
 const { fromZonedTime } = require("date-fns-tz");
@@ -210,6 +221,129 @@ function mapVerifyModeToEventType(verifyMode) {
 }
 
 /**
+ * Normalizes a stored Scanner.fkwebAcceptAfter into a Date, or null.
+ * Accepts a Date (what Mongoose returns), an ISO string or epoch milliseconds so
+ * the gate cannot be defeated by an unexpected hydration shape. Anything else,
+ * including an absent value, resolves to null, which the gate treats as "not
+ * activated" - the safe state.
+ */
+function readFkWebAcceptAfter(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    const fromEpoch = new Date(value);
+    return Number.isNaN(fromEpoch.getTime()) ? null : fromEpoch;
+  }
+  if (typeof value === "string") {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+  return null;
+}
+
+/**
+ * Decides whether one RS9n realtime_glog record may enter the shared attendance
+ * pipeline, using ONLY the device-reported io_time and the registered Scanner's
+ * fkwebAcceptAfter. The HTTP arrival time is deliberately never consulted: a
+ * buffered backlog replayed at 09:00 must still be recognised as backlog.
+ *
+ * This is a pure predicate. It duplicates no attendance business logic and calls
+ * nothing: processScannerEvent() remains the single place attendance is decided.
+ *
+ * @returns {{allow: boolean, reason: string|null, cutoff: Date|null, eventTime: Date|null}}
+ *   reason is "cutoff_not_activated", "historical" or "invalid_event_time" when
+ *   allow is false, and null when allow is true.
+ */
+function evaluateFkWebCutoff({ scanner, timestamp }) {
+  const eventTime = timestamp instanceof Date && !Number.isNaN(timestamp.getTime()) ? timestamp : null;
+  const cutoff = readFkWebAcceptAfter(scanner && scanner.fkwebAcceptAfter);
+
+  // Not activated yet. Every record is treated as backlog: this is the state the
+  // RS9n stays in until an operator explicitly sets the boundary.
+  if (!cutoff) return { allow: false, reason: "cutoff_not_activated", cutoff: null, eventTime };
+
+  // Without a usable device io_time there is nothing to compare, so the record
+  // cannot be proven to be at/after the boundary.
+  if (!eventTime) return { allow: false, reason: "invalid_event_time", cutoff, eventTime: null };
+
+  // Strictly older than the boundary is backlog. Equal is eligible, so an
+  // operator activating at exactly the minute a scan happened still keeps it.
+  if (eventTime.getTime() < cutoff.getTime()) {
+    return { allow: false, reason: "historical", cutoff, eventTime };
+  }
+
+  return { allow: true, reason: null, cutoff, eventTime };
+}
+
+// Activation timestamps are supplied by an operator, so they may arrive either as
+// an unambiguous instant (ISO-8601 with an offset or Z) or as a bare wall-clock
+// reading in the scanner's timezone. A compact 14-digit value is accepted too so
+// an operator can paste a timestamp copied straight off the RS9n.
+const ISO_WITH_OFFSET_PATTERN = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:?\d{2})$/i;
+const NAIVE_WALL_CLOCK_PATTERN = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/;
+const COMPACT_14_PATTERN = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/;
+
+/**
+ * Parses an operator-supplied fkwebAcceptAfter value into an absolute Date.
+ *
+ * A bare wall-clock reading is interpreted in the scanner's deviceTimezone
+ * (Asia/Kolkata by default), which is the same convention parseFkWebIoTime()
+ * applies to the device side of the comparison, so the boundary is always read
+ * the same way from both ends.
+ *
+ * There is deliberately NO fallback to the current server time. An unparseable
+ * value returns null and the caller must reject it, because a silently defaulted
+ * activation timestamp would destroy the very audit boundary this field exists
+ * to create.
+ *
+ * @returns {Date|null} null when the value cannot be parsed. `undefined`/null/
+ *   empty input is rejected too; clearing an activation is a distinct, explicit
+ *   operation handled by the caller.
+ */
+function parseFkWebAcceptAfter(value, timezone) {
+  if (value === undefined || value === null) return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : new Date(value.getTime());
+
+  if (typeof value === "number") return null;
+
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return null;
+
+  // An explicit offset/Z is already unambiguous.
+  if (ISO_WITH_OFFSET_PATTERN.test(text)) {
+    const parsed = new Date(text.replace(" ", "T"));
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  const compact = text.match(COMPACT_14_PATTERN);
+  if (compact) {
+    const [, year, month, day, hour, minute, second] = compact;
+    return parseFkWebIoTime(`${year}${month}${day}${hour}${minute}${second}`, timezone);
+  }
+
+  const naive = text.match(NAIVE_WALL_CLOCK_PATTERN);
+  if (naive) {
+    const [, year, month, day, hour = "00", minute = "00", second = "00"] = naive;
+    return parseFkWebIoTime(`${year}${month}${day}${hour}${minute}${second}`, timezone);
+  }
+
+  return null;
+}
+
+/**
+ * True when a Scanner is an FkWeb-family device the cutoff applies to.
+ * The RS9n is registered with protocol "p2p"; eSSL K30s are tcp/usb. The
+ * brand/model check is a permissive secondary signal so an unusual protocol
+ * value cannot lock an operator out of activation.
+ */
+function isFkWebCapableScanner(scanner) {
+  if (!scanner) return false;
+  if (scanner.protocol === "p2p") return true;
+  return /realtime|rs9/i.test(`${scanner.brand || ""} ${scanner.model || ""}`);
+}
+
+/**
  * Builds a deterministic deviceEventId for a realtime_glog record.
  *
  * Every component is derived from the registered Scanner document or from the
@@ -295,5 +429,9 @@ module.exports = {
   parseFkWebIoTime,
   mapVerifyModeToEventType,
   makeFkWebDeviceEventId,
-  toFkWebScannerEvent
+  toFkWebScannerEvent,
+  readFkWebAcceptAfter,
+  evaluateFkWebCutoff,
+  parseFkWebAcceptAfter,
+  isFkWebCapableScanner
 };

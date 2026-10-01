@@ -42,6 +42,16 @@ const scannerSchema = new mongoose.Schema(
     lastSeen: { type: Date, default: null },
     lastEventAt: { type: Date, default: null },
     lastSync: { type: Date, default: null },
+    // Historical-log cutoff for the FkWeb / realtime Biometric RS9n only.
+    //   null  -> RS9n attendance ingestion is NOT activated: every realtime_glog
+    //            record is ACKed and ignored (production safety state).
+    //   Date  -> realtime_glog records whose device io_time is strictly earlier
+    //            than this instant are ACKed and ignored; at/after it, normal
+    //            processScannerEvent() processing applies.
+    // Nullable on purpose: existing K30 scanners keep working untouched, and
+    // registration never auto-populates it (activation is a separate, explicit
+    // admin operation - see activateFkwebCutoff in scanner.controller.js).
+    fkwebAcceptAfter: { type: Date, default: null },
     errorLogs: [errorLogSchema],
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   },

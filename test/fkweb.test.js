@@ -27,12 +27,23 @@ let scannerDocs = [];
 let memberDocs = [];
 let attendanceStore = [];
 let scannerEventStore = [];
+// Counts ScannerEvent.findOne calls. processScannerEvent()'s very first action is
+// `ScannerEvent.findOne({ deviceEventId })`, so this counter is a direct spy on
+// whether the shared attendance pipeline was entered at all. It is asserted in the
+// cutoff tests to prove a backlogged record never reaches it, which is stronger
+// than inferring it from an unchanged Attendance count.
+let pipelineLookups = 0;
 
 const FAKE_ID = { counter: 0 };
 const nextId = (prefix) => `${prefix}_${++FAKE_ID.counter}`;
 
 const ScannerMock = {
   async findOne(query) {
+    // Serial lookup is how both the FkWeb and the K30 device paths resolve a
+    // scanner from the wire; _id+gymId is how the admin scanner API does.
+    if (query && query._id !== undefined) {
+      return scannerDocs.find((d) => d._id === query._id && d.gymId === query.gymId) || null;
+    }
     return scannerDocs.find((d) => d.serial === query.serial) || null;
   }
 };
@@ -74,6 +85,7 @@ const AttendanceMock = {
 
 const ScannerEventMock = {
   async findOne(query) {
+    pipelineLookups += 1;
     return scannerEventStore.find((d) => d.deviceEventId === query.deviceEventId) || null;
   },
   async create(doc) {
@@ -103,6 +115,18 @@ const parser = require(path.join(ROOT, "utils/fkwebParser.js"));
 const { findScannerByDevId } = require(path.join(ROOT, "services/fkwebDeviceLookup.js"));
 const { processScannerEvent } = require(path.join(ROOT, "services/scanner.service.js"));
 const { handleFkWeb, fkwebErrorHandler, ACK_HEADERS } = require(path.join(ROOT, "controllers/fkweb.controller.js"));
+const { activateFkwebCutoff } = require(path.join(ROOT, "controllers/scanner.controller.js"));
+
+// ------------------------------------------------------------
+// Cutoff fixtures
+// ------------------------------------------------------------
+
+// The cutoff every other test runs with: activated long before any io_time used
+// in this file, so the historical tests are the only ones that exercise the
+// boundary. Each cutoff test overrides this explicitly.
+const ACTIVE_CUTOFF = new Date("2026-01-01T00:00:00+05:30");
+// The boundary used by tests B-D. 2026-10-01T12:00:00 Asia/Kolkata.
+const BOUNDARY_CUTOFF = new Date("2026-10-01T12:00:00+05:30");
 
 // ------------------------------------------------------------
 // Test app: replicates the server.js middleware ordering exactly
@@ -149,8 +173,12 @@ function resetFixtures() {
       deviceId: "RS9N-BRANCH-2",
       serial: "RSS202503111226",
       deviceTimezone: "Asia/Kolkata",
+      protocol: "p2p",
       status: "online",
       settings: { enableCheckOutOnSecondScan: true },
+      // Mirrors the production Danbaba RS9n, but with the cutoff already
+      // activated. Production keeps this null until activation is run explicitly.
+      fkwebAcceptAfter: ACTIVE_CUTOFF,
       lastSeen: null,
       save: async function save() { return this; }
     }
@@ -161,6 +189,7 @@ function resetFixtures() {
   ];
   attendanceStore = [];
   scannerEventStore = [];
+  pipelineLookups = 0;
 }
 
 // ------------------------------------------------------------
@@ -361,6 +390,106 @@ test("findScannerByDevId resolves the registered Scanner and rejects unknown dev
 });
 
 // ------------------------------------------------------------
+// 1b. HISTORICAL-LOG CUTOFF: pure gate predicates
+// ------------------------------------------------------------
+
+test("CUTOFF: a null cutoff is never activated and ignores every record", () => {
+  for (const unset of [null, undefined, ""]) {
+    const gate = parser.evaluateFkWebCutoff({
+      scanner: { serial: "RSS202503111226", fkwebAcceptAfter: unset },
+      timestamp: new Date("2026-10-01T07:00:00.000Z")
+    });
+    assert.equal(gate.allow, false);
+    assert.equal(gate.reason, "cutoff_not_activated");
+    assert.equal(gate.cutoff, null);
+  }
+});
+
+test("CUTOFF: a record before the boundary is historical, at or after is allowed", () => {
+  const scanner = { serial: "RSS202503111226", fkwebAcceptAfter: BOUNDARY_CUTOFF };
+  const at = parser.parseFkWebIoTime("20261001120000", "Asia/Kolkata");
+  assert.equal(at.toISOString(), "2026-10-01T06:30:00.000Z");
+
+  const before = parser.evaluateFkWebCutoff({
+    scanner,
+    timestamp: parser.parseFkWebIoTime("20260930120000", "Asia/Kolkata")
+  });
+  assert.equal(before.allow, false);
+  assert.equal(before.reason, "historical");
+  assert.equal(before.eventTime.toISOString(), "2026-09-30T06:30:00.000Z");
+
+  const exact = parser.evaluateFkWebCutoff({ scanner, timestamp: at });
+  assert.equal(exact.allow, true, "an event exactly at the cutoff must be eligible");
+  assert.equal(exact.reason, null);
+
+  const after = parser.evaluateFkWebCutoff({
+    scanner,
+    timestamp: parser.parseFkWebIoTime("20261001120001", "Asia/Kolkata")
+  });
+  assert.equal(after.allow, true);
+});
+
+test("CUTOFF: the comparison uses the device io_time, never the arrival time", () => {
+  // A record from June read by the server at today's date: the gate must still
+  // see June, otherwise a replayed backlog would be mistaken for live traffic.
+  const scanner = { serial: "RSS202503111226", fkwebAcceptAfter: BOUNDARY_CUTOFF };
+  const june = parser.parseFkWebIoTime("20260615103000", "Asia/Kolkata");
+  assert.equal(parser.evaluateFkWebCutoff({ scanner, timestamp: june }).allow, false);
+  assert.notEqual(june.getTime(), Date.now());
+});
+
+test("CUTOFF: a missing or unusable event timestamp cannot be proven eligible", () => {
+  const scanner = { serial: "RSS202503111226", fkwebAcceptAfter: BOUNDARY_CUTOFF };
+  for (const bad of [undefined, null, "20261001120000", new Date("nope")]) {
+    const gate = parser.evaluateFkWebCutoff({ scanner, timestamp: bad });
+    assert.equal(gate.allow, false, `expected a refusal for ${String(bad)}`);
+    assert.equal(gate.reason, "invalid_event_time");
+  }
+});
+
+test("CUTOFF: readFkWebAcceptAfter survives unexpected stored shapes and fails closed", () => {
+  assert.equal(parser.readFkWebAcceptAfter(BOUNDARY_CUTOFF).toISOString(), BOUNDARY_CUTOFF.toISOString());
+  assert.equal(parser.readFkWebAcceptAfter("2026-10-01T06:30:00.000Z").toISOString(), "2026-10-01T06:30:00.000Z");
+  assert.equal(parser.readFkWebAcceptAfter(BOUNDARY_CUTOFF.getTime()).toISOString(), BOUNDARY_CUTOFF.toISOString());
+  // Anything unrecognised must resolve to null, which the gate reads as "not
+  // activated" - it can never be read as "accept everything".
+  for (const bad of [null, undefined, "", "not-a-date", {}, [], NaN, new Date("nope")]) {
+    assert.equal(parser.readFkWebAcceptAfter(bad), null, `expected null for ${JSON.stringify(bad)}`);
+  }
+});
+
+test("ACTIVATION: an explicit timestamp is required and is never defaulted to now", () => {
+  assert.equal(parser.parseFkWebAcceptAfter("20261001120000", "Asia/Kolkata").toISOString(), "2026-10-01T06:30:00.000Z");
+  assert.equal(parser.parseFkWebAcceptAfter("2026-10-01T12:00:00", "Asia/Kolkata").toISOString(), "2026-10-01T06:30:00.000Z");
+  assert.equal(parser.parseFkWebAcceptAfter("2026-10-01 12:00:00", "Asia/Kolkata").toISOString(), "2026-10-01T06:30:00.000Z");
+  assert.equal(parser.parseFkWebAcceptAfter("2026-10-01T12:00", "Asia/Kolkata").toISOString(), "2026-10-01T06:30:00.000Z");
+  assert.equal(parser.parseFkWebAcceptAfter("2026-10-01", "Asia/Kolkata").toISOString(), "2026-09-30T18:30:00.000Z");
+  // An explicit offset or Z is honoured verbatim, independent of the scanner tz.
+  assert.equal(parser.parseFkWebAcceptAfter("2026-10-01T12:00:00Z", "Asia/Kolkata").toISOString(), "2026-10-01T12:00:00.000Z");
+  assert.equal(parser.parseFkWebAcceptAfter("2026-10-01T12:00:00+00:00", "Asia/Kolkata").toISOString(), "2026-10-01T12:00:00.000Z");
+  const asDate = new Date("2026-10-01T06:30:00.000Z");
+  assert.equal(parser.parseFkWebAcceptAfter(asDate, "Asia/Kolkata").getTime(), asDate.getTime());
+
+  for (const bad of [undefined, null, "", "   ", "now", "tomorrow", Date.now(), 1760000000000, "01/10/2026", {}]) {
+    assert.equal(parser.parseFkWebAcceptAfter(bad, "Asia/Kolkata"), null, `expected a rejection for ${JSON.stringify(bad)}`);
+  }
+});
+
+test("ACTIVATION: a wall-clock boundary is read in the scanner timezone", () => {
+  // Same operator string, two scanners in different timezones: the stored instant
+  // must differ, exactly as the device-side io_time comparison does.
+  assert.equal(parser.parseFkWebAcceptAfter("2026-10-01T12:00:00", "Asia/Kolkata").toISOString(), "2026-10-01T06:30:00.000Z");
+  assert.equal(parser.parseFkWebAcceptAfter("2026-10-01T12:00:00", "UTC").toISOString(), "2026-10-01T12:00:00.000Z");
+});
+
+test("ACTIVATION: only FkWeb-family scanners are eligible for the cutoff", () => {
+  assert.equal(parser.isFkWebCapableScanner({ protocol: "p2p", brand: "realtime", model: "RS9n" }), true);
+  assert.equal(parser.isFkWebCapableScanner({ protocol: "tcp", brand: "realtime", model: "RS9n" }), true);
+  assert.equal(parser.isFkWebCapableScanner({ protocol: "tcp", brand: "eSSL", model: "K30 Pro" }), false);
+  assert.equal(parser.isFkWebCapableScanner(null), false);
+});
+
+// ------------------------------------------------------------
 // 2. Branch isolation through the REAL processScannerEvent
 // ------------------------------------------------------------
 
@@ -514,6 +643,298 @@ test("STARTUP", async () => {
   await new Promise((resolve) => { server = app.listen(0, "127.0.0.1", resolve); });
   port = server.address().port;
   assert.ok(port > 0);
+});
+
+// ------------------------------------------------------------
+// 3b. HISTORICAL-LOG CUTOFF over the real HTTP protocol contract
+//
+// Every test here asserts the ACK separately from the attendance outcome: an
+// ignored record must still be ACKed with the normal FkWeb success response, or
+// the RS9n retries a record that must never succeed.
+// ------------------------------------------------------------
+
+test("CUTOFF A: a registered but NOT-activated RS9n ACKs every record and creates no attendance", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = null;
+
+  // Both a backlogged record and a plausible "new" record are refused: while the
+  // cutoff is null the device is not live for attendance at all.
+  for (const ioTime of ["20260930120000", "20261001123000"]) {
+    const res = await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", ioTime));
+    assert.equal(res.status, 200, "the device must always be ACKed");
+    assert.equal(res.headers["response_code"], "OK");
+    assert.equal(res.headers["content-length"], "0");
+    assert.equal(res.body.length, 0);
+  }
+
+  assert.equal(attendanceStore.length, 0, "attendance must be untouched");
+  assert.equal(scannerEventStore.length, 0, "no attendance event may be recorded");
+  assert.equal(pipelineLookups, 0, "processScannerEvent() must never be entered");
+});
+
+test("CUTOFF A2: the not-activated state ignores a full backlog drain without ever entering the pipeline", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = null;
+
+  // Stands in for the ~9,293 buffered Time Logs the physical RS9n replays on
+  // connect: many records, all ACKed, none of them able to become attendance.
+  for (let i = 0; i < 50; i++) {
+    const ioTime = `202609${String(1 + (i % 28)).padStart(2, "0")}${String(8 + (i % 12)).padStart(2, "0")}15`;
+    const res = await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", ioTime));
+    assert.equal(res.status, 200, `record ${i} must be ACKed`);
+    assert.equal(res.headers["response_code"], "OK");
+  }
+
+  assert.equal(attendanceStore.length, 0, "a backlog drain must produce no attendance");
+  assert.equal(scannerEventStore.length, 0);
+  assert.equal(pipelineLookups, 0, "not one backlog record may reach processScannerEvent()");
+});
+
+test("CUTOFF B: an event before the cutoff is ACKed and ignored", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = BOUNDARY_CUTOFF;
+
+  const res = await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", "20260930120000"));
+
+  assert.equal(res.status, 200, "a historical record is NOT an error");
+  assert.equal(res.headers["response_code"], "OK");
+  assert.equal(res.headers["content-length"], "0");
+  assert.equal(attendanceStore.length, 0, "historical attendance must not be created");
+  assert.equal(scannerEventStore.length, 0, "no attendance event for a historical record");
+  assert.equal(pipelineLookups, 0, "processScannerEvent() must not be called for backlog");
+});
+
+test("CUTOFF B2: a mixed drain keeps only the records at or after the cutoff", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = BOUNDARY_CUTOFF;
+
+  // Backlog before the boundary, then two live scans after it.
+  for (const ioTime of ["20260615103000", "20260930120000", "20261001115959"]) {
+    await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", ioTime));
+  }
+  assert.equal(attendanceStore.length, 0, "backlog must not create attendance");
+  assert.equal(pipelineLookups, 0);
+
+  // 12:00:00 is exactly the boundary, 12:30:00 is after it: check-in then check-out.
+  await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", "20261001120000"));
+  assert.equal(attendanceStore.length, 1, "the boundary event itself is processed");
+  assert.equal(attendanceStore[0].checkIn.toISOString(), "2026-10-01T06:30:00.000Z", "check-in uses the device io_time");
+
+  await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", "20261001123000"));
+  assert.equal(attendanceStore.length, 1, "the second live scan is a checkout, not a new row");
+  assert.equal(attendanceStore[0].checkOut.toISOString(), "2026-10-01T07:00:00.000Z");
+  assert.equal(attendanceStore[0].branchCode, "BR2");
+  assert.equal(scannerEventStore.length, 2, "only the two eligible records are recorded");
+});
+
+test("CUTOFF C: an event exactly at the cutoff is eligible for normal processing", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = BOUNDARY_CUTOFF;
+
+  const res = await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", "20261001120000"));
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers["response_code"], "OK");
+  assert.equal(attendanceStore.length, 1, "io_time == fkwebAcceptAfter must be processed");
+  assert.equal(attendanceStore[0].checkIn.toISOString(), "2026-10-01T06:30:00.000Z");
+  assert.equal(scannerEventStore[0].decision, "allow");
+});
+
+test("CUTOFF D: an event after the cutoff follows the existing RS9n flow", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = BOUNDARY_CUTOFF;
+
+  const res = await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", "20261001123000"));
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers["response_code"], "OK");
+  assert.ok(pipelineLookups > 0, "the shared pipeline must be entered");
+  assert.equal(attendanceStore.length, 1);
+  assert.equal(attendanceStore[0].member, "mem_b2", "the Branch-2 member is resolved");
+  assert.equal(attendanceStore[0].branchCode, "BR2", "branch comes from the scanner, never the request");
+  assert.equal(attendanceStore[0].source, "scanner");
+  assert.equal(attendanceStore[0].eventType, "card");
+  assert.equal(attendanceStore[0].date, "2026-10-01");
+  assert.equal(scannerEventStore.length, 1);
+  assert.equal(scannerEventStore[0].decision, "allow");
+});
+
+test("CUTOFF E: replaying the same post-cutoff event twice yields one attendance row", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = BOUNDARY_CUTOFF;
+
+  const first = await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", "20261001123000"));
+  const second = await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", "20261001123000"));
+
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200, "the retry must still be ACKed");
+  assert.equal(second.headers["response_code"], "OK");
+  assert.equal(attendanceStore.length, 1, "a device replay must not create a second attendance row");
+  assert.equal(scannerEventStore.length, 1);
+  // The deterministic deviceEventId is what collapses the retry: same serial,
+  // user_id, io_time, io_mode and verify_mode produce a byte-identical id.
+  assert.equal(scannerEventStore[0].deviceEventId, parser.makeFkWebDeviceEventId({
+    scanner: scannerDocs[0],
+    userId: "2002",
+    ioTimeRaw: "20261001123000",
+    timestamp: parser.parseFkWebIoTime("20261001123000", "Asia/Kolkata"),
+    ioMode: 1,
+    verifyMode: 2
+  }));
+});
+
+test("CUTOFF F: a post-cutoff event for a member of another branch is denied", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = BOUNDARY_CUTOFF;
+
+  const res = await fkweb("realtime_glog", "RSS202503111226", GLOG("1001", "20261001123000"));
+
+  assert.equal(res.status, 200);
+  assert.equal(attendanceStore.length, 0, "no attendance for a cross-branch member");
+  assert.equal(scannerEventStore.length, 1);
+  assert.equal(scannerEventStore[0].decision, "deny");
+  assert.equal(scannerEventStore[0].reason, "branch_mismatch");
+});
+
+test("CUTOFF G: a post-cutoff event for an unknown member is ACKed with no attendance", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = BOUNDARY_CUTOFF;
+
+  const res = await fkweb("realtime_glog", "RSS202503111226", GLOG("99999999", "20261001123000"));
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers["response_code"], "OK");
+  assert.equal(attendanceStore.length, 0);
+  assert.equal(scannerEventStore[0].reason, "unknown_user");
+});
+
+test("CUTOFF H: malformed records are ACKed at or after the cutoff and never crash", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = BOUNDARY_CUTOFF;
+
+  const bodies = [
+    Buffer.alloc(0),
+    Buffer.from('{"user_id": broken', "utf8"),
+    Buffer.from("{"),
+    Buffer.from([0xff, 0xfe, 0x00, 0x01]),
+    Buffer.from(GLOG("2002", "2026100")),
+    Buffer.from(GLOG("2002", "")),
+    Buffer.from('{"user_id":"2002","io_time":"20261001123000"', "utf8")
+  ];
+  for (const body of bodies) {
+    const res = await fkweb("realtime_glog", "RSS202503111226", body);
+    assert.equal(res.status, 200, `expected an ACK for a ${body.length}-byte body`);
+    assert.equal(res.headers["response_code"], "OK");
+  }
+  assert.equal(attendanceStore.length, 0);
+
+  // The listener is still healthy and still enforces the cutoff correctly.
+  const after = await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", "20261001123000"));
+  assert.equal(after.status, 200);
+  assert.equal(attendanceStore.length, 1, "the server still processes correctly after the abuse run");
+});
+
+test("CUTOFF: an unregistered RS9n is still ACKed and ignored", async () => {
+  resetFixtures();
+  const res = await fkweb("realtime_glog", "RSS000000000000", GLOG("2002", "20261001123000"));
+  assert.equal(res.status, 200);
+  assert.equal(res.headers["response_code"], "OK");
+  assert.equal(attendanceStore.length, 0);
+  assert.equal(pipelineLookups, 0, "an unregistered device must never reach the pipeline");
+});
+
+// ------------------------------------------------------------
+// 3c. Activation operation
+// ------------------------------------------------------------
+
+function fakeRes() {
+  const res = {
+    statusCode: null,
+    body: null,
+    status(code) { this.statusCode = code; return this; },
+    json(payload) { this.body = payload; return this; }
+  };
+  return res;
+}
+
+function adminReq(body, branchCode = "BR2") {
+  return { user: { _id: "u_admin", role: "admin", branchCode }, gymId: "MAIN", params: { id: "scn_rs9n_b2" }, body };
+}
+
+test("ACTIVATION: an explicit boundary is stored, and the device obeys it immediately", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = null;
+
+  const res = fakeRes();
+  await activateFkwebCutoff(adminReq({ acceptAfter: "2026-10-01T12:00:00" }), res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(scannerDocs[0].fkwebAcceptAfter.toISOString(), "2026-10-01T06:30:00.000Z");
+  assert.equal(res.body.data.fkwebAcceptAfter, "2026-10-01T06:30:00.000Z");
+  assert.equal(res.body.data.timezone, "Asia/Kolkata");
+
+  // The same backlog record that was ignored before activation is still ignored.
+  await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", "20260930120000"));
+  assert.equal(attendanceStore.length, 0);
+
+  // A record after the new boundary is processed.
+  await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", "20261001123000"));
+  assert.equal(attendanceStore.length, 1);
+});
+
+test("ACTIVATION: the boundary must be supplied explicitly, never defaulted to now", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = null;
+
+  for (const body of [{}, { acceptAfter: "later" }, { acceptAfter: "" }, { acceptAfter: Date.now() }]) {
+    await assert.rejects(() => activateFkwebCutoff(adminReq(body), fakeRes()), (err) => err.statusCode === 400);
+  }
+  assert.equal(scannerDocs[0].fkwebAcceptAfter, null, "a rejected activation must leave the cutoff unset");
+});
+
+test("ACTIVATION: only an authorized branch admin may move the boundary", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = null;
+
+  for (const role of ["superadmin", "trainer", "member"]) {
+    const req = adminReq({ acceptAfter: "2026-10-01T12:00:00" });
+    req.user.role = role;
+    await assert.rejects(() => activateFkwebCutoff(req, fakeRes()), (err) => err.statusCode === 403);
+  }
+
+  // An admin from another branch must not be able to move this scanner's boundary.
+  await assert.rejects(
+    () => activateFkwebCutoff(adminReq({ acceptAfter: "2026-10-01T12:00:00" }, "MAIN"), fakeRes()),
+    (err) => err.statusCode === 404
+  );
+
+  assert.equal(scannerDocs[0].fkwebAcceptAfter, null);
+});
+
+test("ACTIVATION: clearing the boundary returns the scanner to the ignore-everything state", async () => {
+  resetFixtures();
+  scannerDocs[0].fkwebAcceptAfter = BOUNDARY_CUTOFF;
+
+  const res = fakeRes();
+  await activateFkwebCutoff(adminReq({ acceptAfter: null }), res);
+  assert.equal(scannerDocs[0].fkwebAcceptAfter, null);
+
+  await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", "20261001123000"));
+  assert.equal(attendanceStore.length, 0, "after clearing, nothing is processed again");
+  assert.equal(pipelineLookups, 0);
+});
+
+test("ACTIVATION: the cutoff cannot be moved on a non-FkWeb scanner", async () => {
+  resetFixtures();
+  scannerDocs[0].brand = "eSSL";
+  scannerDocs[0].model = "K30 Pro";
+  scannerDocs[0].protocol = "tcp";
+
+  await assert.rejects(
+    () => activateFkwebCutoff(adminReq({ acceptAfter: "2026-10-01T12:00:00" }), fakeRes()),
+    (err) => err.statusCode === 400
+  );
+  assert.equal(scannerDocs[0].fkwebAcceptAfter, ACTIVE_CUTOFF);
 });
 
 test("ACK: realtime_glog returns exactly HTTP 200 + response_code: OK + Content-Length: 0", async () => {
@@ -743,6 +1164,55 @@ test("K30 REGRESSION: /iclock still works after RS9n traffic and vice versa", as
   assert.equal(k30.status, 200, "K30 ATTLOG push must still be ACKed with 200");
   assert.equal(k30.body.toString().trim(), "OK", "K30 must still receive the plain-text OK ack");
   assert.ok(attendanceStore.some((a) => a.branchCode === "MAIN"), "K30 attendance must still be created");
+});
+
+test("K30 REGRESSION: a K30 whose fkwebAcceptAfter is NULL still creates attendance", async () => {
+  resetFixtures();
+  // The strongest guarantee the cutoff can offer the K30 integration: the field
+  // is inert outside the FkWeb path. /iclock never reads it, so a K30 registered
+  // with no cutoff at all - which is every existing K30 - behaves exactly as before.
+  scannerDocs[0].fkwebAcceptAfter = null;
+  scannerDocs[0].brand = "eSSL";
+  scannerDocs[0].model = "K30 Pro";
+  scannerDocs[0].protocol = "tcp";
+  scannerDocs[0].branchCode = "MAIN";
+  memberDocs[0].branchCode = "MAIN";
+
+  const res = await request(
+    { method: "POST", path: "/iclock/cdata?SN=RSS202503111226&table=ATTLOG", headers: { "Content-Type": "text/plain" } },
+    Buffer.from("1001\t2026-09-30 11:15:51\t1\t0\t0\t0", "utf8")
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.toString().trim(), "OK", "K30 must still receive the plain-text OK ack");
+  assert.equal(attendanceStore.length, 1, "a null RS9n cutoff must not disable K30 attendance");
+  assert.equal(attendanceStore[0].branchCode, "MAIN");
+});
+
+test("K30 REGRESSION: an RS9n backlog drain neither blocks nor pollutes K30 attendance", async () => {
+  resetFixtures();
+  // Not activated: the RS9n replays its backlog and every record is dropped.
+  scannerDocs[0].fkwebAcceptAfter = null;
+  for (let i = 0; i < 20; i++) {
+    const res = await fkweb("realtime_glog", "RSS202503111226", GLOG("2002", `2026093012${String(i).padStart(2, "0")}00`));
+    assert.equal(res.status, 200);
+  }
+  assert.equal(attendanceStore.length, 0, "the drain creates nothing");
+  assert.equal(pipelineLookups, 0);
+
+  // The K30 then pushes for real and is unaffected.
+  scannerDocs[0].brand = "eSSL";
+  scannerDocs[0].model = "K30 Pro";
+  scannerDocs[0].branchCode = "MAIN";
+  memberDocs[0].branchCode = "MAIN";
+  const res = await request(
+    { method: "POST", path: "/iclock/cdata?SN=RSS202503111226&table=ATTLOG", headers: { "Content-Type": "text/plain" } },
+    Buffer.from("1001\t2026-09-30 11:15:51\t1\t0\t0\t0", "utf8")
+  );
+  assert.equal(res.status, 200);
+  assert.equal(attendanceStore.length, 1);
+  assert.equal(attendanceStore[0].member, "mem_b1", "only the K30 record may produce attendance");
+  assert.equal(scannerEventStore.length, 1, "no RS9n ScannerEvent may exist");
 });
 
 test("SHUTDOWN", async () => {
