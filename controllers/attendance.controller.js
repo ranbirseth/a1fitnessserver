@@ -5,7 +5,7 @@ const { asyncHandler } = require("../utils/asyncHandler");
 const { sendResponse } = require("../utils/response");
 const { getPagination } = require("../utils/pagination");
 const { AppError } = require("../utils/appError");
-const { getTodayDate, formatDateInTimezone } = require("../utils/date");
+const { getTodayDate, formatDateInTimezone, getNoonInTimezone } = require("../utils/date");
 const { assertMemberEligible } = require("../utils/membership");
 const { getCache, setCache } = require("../services/cache.service");
 
@@ -100,7 +100,7 @@ const markAttendance = asyncHandler(async (req, res) => {
     }
   }
 
-  assertMemberEligible(member);
+  await assertMemberEligible(member);
 
   const today = getTodayDate();
   const gymId = member.gymId;
@@ -124,6 +124,8 @@ const markAttendance = asyncHandler(async (req, res) => {
       date: today,
       checkIn: serverTime,
       status: isLate ? "late" : "present",
+      membershipValidAtEvent: true,
+      membershipValidatedAt: new Date(),
       location: location ? { checkIn: location } : undefined,
       auditLogs: isAdminOrTrainer ? [{
         action: "manual_checkin",
@@ -219,7 +221,7 @@ const memberCheckIn = asyncHandler(async (req, res) => {
   const member = await Member.findOne({ user: req.user._id, gymId: req.gymId });
   if (!member) throw new AppError("Member profile not found", 404);
 
-  assertMemberEligible(member);
+  await assertMemberEligible(member);
 
   const cacheKey = `attendance:today:${req.gymId}:${member._id}`;
   const cachedStatus = await getCache(cacheKey);
@@ -254,6 +256,8 @@ const memberCheckIn = asyncHandler(async (req, res) => {
     date: today,
     checkIn: serverTime,
     status: isLate ? "late" : "present",
+    membershipValidAtEvent: true,
+    membershipValidatedAt: new Date(),
     location: {
       checkIn: { latitude, longitude, accuracy }
     },
@@ -294,7 +298,7 @@ const memberCheckOut = asyncHandler(async (req, res) => {
   const member = await Member.findOne({ user: req.user._id, gymId: req.gymId });
   if (!member) throw new AppError("Member profile not found", 404);
 
-  assertMemberEligible(member);
+  await assertMemberEligible(member);
 
   const today = getTodayDate();
   const attendance = await Attendance.findOne({ member: member._id, date: today, deletedAt: null });
@@ -357,7 +361,12 @@ const getMyAttendance = asyncHandler(async (req, res) => {
   const { skip, limit, page } = getPagination(req.query);
   const { startDate, endDate, status, search } = req.query;
 
-  const query = { gymId: req.gymId, member: member._id, deletedAt: null };
+  const query = {
+    gymId: req.gymId,
+    member: member._id,
+    deletedAt: null,
+    membershipValidAtEvent: { $ne: false }
+  };
 
   if (startDate || endDate) {
     query.date = {};
@@ -421,7 +430,8 @@ const calculateWorkoutStats = async (memberId, startDate, endDate) => {
   const monthRecords = await Attendance.find({
     member: memberId,
     date: { $gte: startDate, $lte: endDate },
-    deletedAt: null
+    deletedAt: null,
+    membershipValidAtEvent: { $ne: false }
   });
 
   const totalRecords = monthRecords.length;
@@ -445,6 +455,7 @@ const calculateWorkoutStats = async (memberId, startDate, endDate) => {
     (await Attendance.find({
       member: memberId,
       deletedAt: null,
+      membershipValidAtEvent: { $ne: false },
       status: { $in: ATTENDED_STATUSES }
     }).select("date")).map(r => r.date)
   );
@@ -516,7 +527,8 @@ const getDailyBreakdown = async (memberId, startDate, endDate) => {
   const records = await Attendance.find({
     member: memberId,
     date: { $gte: startDate, $lte: endDate },
-    deletedAt: null
+    deletedAt: null,
+    membershipValidAtEvent: { $ne: false }
   }).sort({ date: 1 });
 
   const breakdown = {
@@ -548,7 +560,8 @@ const getDailyBreakdown = async (memberId, startDate, endDate) => {
 const calculateCurrentStreak = async (memberId) => {
   const records = await Attendance.find({
     member: memberId,
-    deletedAt: null
+    deletedAt: null,
+    membershipValidAtEvent: { $ne: false }
   })
   .sort({ date: -1 })
   .limit(365);
@@ -577,7 +590,8 @@ const calculateCurrentStreak = async (memberId) => {
 const calculateLongestStreak = async (memberId) => {
   const records = await Attendance.find({
     member: memberId,
-    deletedAt: null
+    deletedAt: null,
+    membershipValidAtEvent: { $ne: false }
   }).sort({ date: 1 });
 
   if (!records.length) return 0;
@@ -611,7 +625,12 @@ const exportMyAttendance = asyncHandler(async (req, res) => {
 
   const { format = "csv", startDate, endDate } = req.query;
 
-  const query = { member: member._id, gymId: req.gymId, deletedAt: null };
+  const query = {
+    member: member._id,
+    gymId: req.gymId,
+    deletedAt: null,
+    membershipValidAtEvent: { $ne: false }
+  };
   if (startDate || endDate) {
     query.date = {};
     if (startDate) query.date.$gte = startDate;
@@ -773,6 +792,9 @@ const history = asyncHandler(async (req, res) => {
   const { search, date } = req.query;
 
   const query = { gymId: req.gymId, deletedAt: null };
+  if (req.query.includeInvalid !== "true") {
+    query.membershipValidAtEvent = { $ne: false };
+  }
   if (date) query.date = date;
   const scopeConditions = [];
 
@@ -830,7 +852,7 @@ const checkIn = asyncHandler(async (req, res) => {
   const member = await Member.findOne({ _id: req.body.member, gymId: req.gymId });
   if (!member) throw new AppError("Member not found", 404);
 
-  assertMemberEligible(member);
+  await assertMemberEligible(member);
 
   if (req.user && req.user.role !== "superadmin") {
     const userBranch = (req.user.branchCode || "MAIN").trim().toUpperCase();
@@ -858,6 +880,8 @@ const checkIn = asyncHandler(async (req, res) => {
     branchCode: member.branchCode || "MAIN",
     member: req.body.member,
     date: today,
+    membershipValidAtEvent: true,
+    membershipValidatedAt: new Date(),
     faceRecognitionMatched: req.body.faceRecognitionMatched ?? null
   });
   if (req.app.locals.io) req.app.locals.io.to(req.gymId).emit("attendance:checkin", entry);
@@ -980,6 +1004,18 @@ const updateAttendance = asyncHandler(async (req, res) => {
   }
 
   const { status, notes, checkIn, checkOut } = req.body;
+
+  const marksAttendance = (status && ATTENDED_STATUSES.includes(status)) || checkIn !== undefined;
+  if (marksAttendance) {
+    if (!attendance.member) throw new AppError("Member profile not found", 404);
+    const timezone = attendance.timezone || undefined;
+    const attendanceDate = attendance.checkIn instanceof Date
+      ? attendance.checkIn
+      : getNoonInTimezone(attendance.date, timezone);
+    await assertMemberEligible(attendance.member, attendanceDate, timezone ? { timezone } : {});
+    attendance.membershipValidAtEvent = true;
+    attendance.membershipValidatedAt = new Date();
+  }
 
   if (status) attendance.status = status;
   if (notes !== undefined) attendance.notes = notes;

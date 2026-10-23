@@ -112,7 +112,7 @@ const getBranchOverview = asyncHandler(async (req, res) => {
   const [totalMembers, activeMembers, staff, revenue, payments, attendance, activeMemberships, expiringMemberships, expiredMemberships, plans] = await Promise.all([
     Member.countDocuments(memberMatch), Member.countDocuments({ ...memberMatch, status: "active", isActivePlan: true }), User.countDocuments({ gymId: req.gymId, branchCode: branch.branchCode, role: { $in: ["admin", "trainer"] } }),
     Payment.aggregate([{ $match: { gymId: req.gymId, member: { $in: memberIds } } }, { $group: { _id: null, total: { $sum: "$amount" }, count: { $sum: 1 } } }]),
-    Payment.countDocuments({ gymId: req.gymId, member: { $in: memberIds } }), Attendance.countDocuments({ gymId: req.gymId, member: { $in: memberIds }, deletedAt: null }),
+    Payment.countDocuments({ gymId: req.gymId, member: { $in: memberIds } }), Attendance.countDocuments({ gymId: req.gymId, member: { $in: memberIds }, deletedAt: null, membershipValidAtEvent: { $ne: false } }),
     Member.countDocuments({ ...memberMatch, isActivePlan: true, status: { $in: ["active", "pending"] } }), Member.countDocuments({ ...memberMatch, membershipExpiryDate: { $gte: new Date(), $lte: new Date(Date.now() + 14 * 86400000) } }), Member.countDocuments({ ...memberMatch, status: { $in: ["expired", "cancelled", "inactive"] } }),
     Member.aggregate([{ $match: memberMatch }, { $group: { _id: "$currentPlan", count: { $sum: 1 } } }, { $lookup: { from: "plans", localField: "_id", foreignField: "_id", as: "plan" } }, { $project: { _id: 1, count: 1, name: { $arrayElemAt: ["$plan.name", 0] } } }, { $sort: { count: -1 } }])
   ]);

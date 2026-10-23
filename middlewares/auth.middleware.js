@@ -88,7 +88,7 @@ const checkPlanAccess = async (req, _res, next) => {
     const member = req.member || (await Member.findOne({ user: req.user._id, gymId: req.gymId }));
     if (!member) return next(Object.assign(new Error("Member profile not found"), { statusCode: 404 }));
     try {
-      assertMemberEligible(member);
+      await assertMemberEligible(member);
     } catch (err) {
       return next(err);
     }

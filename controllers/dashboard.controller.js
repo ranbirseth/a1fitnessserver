@@ -49,6 +49,7 @@ const getStats = asyncHandler(async (req, res) => {
   const attendanceMatch = {
     gymId: req.gymId,
     deletedAt: null,
+    membershipValidAtEvent: { $ne: false },
     checkIn: { $gte: startOfDay, $lte: endOfDay },
     // Scope by the member's CURRENT branch (every attendance is member-linked).
     ...(activeBranch ? { member: { $in: memberIdsInBranch } } : {}),
@@ -85,7 +86,7 @@ const getStats = asyncHandler(async (req, res) => {
     Promise.all([
       Member.find({ gymId: req.gymId, ...branchFilter, ...trainerFilter }).sort({ createdAt: -1 }).limit(3).populate("user", "name"),
       Payment.find(paymentMatch).sort({ createdAt: -1 }).limit(3).populate({ path: "member", populate: { path: "user", select: "name" } }),
-      Attendance.find({ gymId: req.gymId, deletedAt: null, ...(activeBranch ? { member: { $in: memberIdsInBranch } } : {}) }).sort({ checkIn: -1 }).limit(3).populate({ path: "member", populate: { path: "user", select: "name" } })
+      Attendance.find({ gymId: req.gymId, deletedAt: null, membershipValidAtEvent: { $ne: false }, ...(activeBranch ? { member: { $in: memberIdsInBranch } } : {}) }).sort({ checkIn: -1 }).limit(3).populate({ path: "member", populate: { path: "user", select: "name" } })
     ])
   ]);
 

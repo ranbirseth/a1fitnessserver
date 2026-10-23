@@ -234,7 +234,7 @@ const getReportOverview = asyncHandler(async (req, res) => {
       status: { $in: ["expired", "cancelled", "inactive"] },
     }),
     (async () => {
-      const attMatch = { gymId, checkIn: { $gte: start, $lte: end }, deletedAt: null };
+      const attMatch = { gymId, checkIn: { $gte: start, $lte: end }, deletedAt: null, membershipValidAtEvent: { $ne: false } };
       const pipeline = [];
       if (filters.branchCode) {
         pipeline.push(
@@ -249,7 +249,7 @@ const getReportOverview = asyncHandler(async (req, res) => {
     })(),
     (async () => {
       const { mode, keys } = getDateBuckets(start, end);
-      const attMatch = { gymId, checkIn: { $gte: start, $lte: end }, deletedAt: null };
+      const attMatch = { gymId, checkIn: { $gte: start, $lte: end }, deletedAt: null, membershipValidAtEvent: { $ne: false } };
       const extra = [];
       if (filters.branchCode) {
         extra.push(
@@ -271,7 +271,7 @@ const getReportOverview = asyncHandler(async (req, res) => {
       return fillSeries(keys, normalizedRows, "count");
     })(),
     (async () => {
-      const attMatch = { gymId, checkIn: { $gte: start, $lte: end }, deletedAt: null };
+      const attMatch = { gymId, checkIn: { $gte: start, $lte: end }, deletedAt: null, membershipValidAtEvent: { $ne: false } };
       const extra = [];
       if (filters.branchCode) {
         extra.push(
@@ -364,7 +364,7 @@ const getFilterOptions = asyncHandler(async (req, res) => {
     Member.aggregate([{ $match: { gymId, ...(req.user?.role !== "superadmin" ? { branchCode: req.user.branchCode || "MAIN" } : {}), ...(req.user?.role === "trainer" ? { trainer: req.user._id } : {}) } }, { $group: { _id: "$status", count: { $sum: 1 } } }]),
     Payment.aggregate([{ $match: { gymId } }, { $group: { _id: "$status", count: { $sum: 1 } } }]),
     Payment.aggregate([{ $match: { gymId } }, { $group: { _id: "$method", count: { $sum: 1 } } }]),
-    Attendance.aggregate([{ $match: { gymId, deletedAt: null } }, { $group: { _id: "$status", count: { $sum: 1 } } }]),
+    Attendance.aggregate([{ $match: { gymId, deletedAt: null, membershipValidAtEvent: { $ne: false } } }, { $group: { _id: "$status", count: { $sum: 1 } } }]),
   ]);
   sendResponse(res, {
     message: "Analytics filter options fetched",
@@ -602,7 +602,7 @@ const exportReport = asyncHandler(async (req, res) => {
       Member.countDocuments({ gymId: req.gymId, ...(filters.branchCode ? { branchCode: filters.branchCode } : {}), ...(filters.memberStatus ? { status: filters.memberStatus } : {}), status: filters.memberStatus || { $in: ["active", "pending"] } }),
       Member.countDocuments({ gymId: req.gymId, ...(filters.branchCode ? { branchCode: filters.branchCode } : {}), ...(filters.memberStatus ? { status: filters.memberStatus } : {}), status: filters.memberStatus || { $in: ["active", "pending"] }, isActivePlan: true }),
       (async () => {
-        const attMatch = { gymId: req.gymId, checkIn: { $gte: start, $lte: end }, deletedAt: null };
+        const attMatch = { gymId: req.gymId, checkIn: { $gte: start, $lte: end }, deletedAt: null, membershipValidAtEvent: { $ne: false } };
         const attExtra = [];
         if (filters.branchCode) {
           attExtra.push(
@@ -668,7 +668,7 @@ const exportReport = asyncHandler(async (req, res) => {
       Payment.aggregate([...paymentExtra, { $match: scopedPaymentMatch }, { $group: { _id: null, total: { $sum: "$amount" }, count: { $sum: 1 } } }]),
       Member.countDocuments({ gymId: req.gymId, ...(filters.branchCode ? { branchCode: filters.branchCode } : {}) }),
       (async () => {
-        const attMatch = { gymId: req.gymId, checkIn: { $gte: start, $lte: end }, deletedAt: null };
+        const attMatch = { gymId: req.gymId, checkIn: { $gte: start, $lte: end }, deletedAt: null, membershipValidAtEvent: { $ne: false } };
         const attExtra = [];
         if (filters.branchCode) {
           attExtra.push(

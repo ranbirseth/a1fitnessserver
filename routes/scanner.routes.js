@@ -2,6 +2,7 @@ const router = require("express").Router();
 const { protect, authorize, adminOnly } = require("../middlewares/auth.middleware");
 const { authenticateDevice } = require("../middlewares/scannerAuth.middleware");
 const { ingestEvents, heartbeat } = require("../controllers/scannerEvents.controller");
+const { redeem } = require("../controllers/doorAuthorization.controller");
 const {
   getScanners,
   createScanner,
@@ -17,6 +18,9 @@ const {
 // Device ingestion (authenticated by device key, no user session)
 router.post("/events", authenticateDevice, ingestEvents);
 router.post("/heartbeat", authenticateDevice, heartbeat);
+// Door-controller redemption is bound to the authenticated scanner key. Tokens
+// are single-use and expire quickly; this endpoint never returns member data.
+router.post("/door-authorizations/redeem", authenticateDevice, redeem);
 
 // Reads: superadmin is read-only (all branches), branch admins scoped to own branch
 router.get("/", protect, authorize("admin", "superadmin"), getScanners);

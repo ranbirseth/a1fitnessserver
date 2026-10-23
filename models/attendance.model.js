@@ -20,6 +20,11 @@ const attendanceSchema = new mongoose.Schema(
       default: "app",
       index: true
     },
+    // True only when the backend validated the member's plan and membership
+    // term for this attendance date at the time the record was accepted. null
+    // marks legacy rows whose historical eligibility cannot be proven.
+    membershipValidAtEvent: { type: Boolean, default: null, index: true },
+    membershipValidatedAt: { type: Date, default: null },
     scanner: { type: mongoose.Schema.Types.ObjectId, ref: "Scanner", default: null, index: true },
     eventType: { type: String, enum: ["fingerprint", "card", "pin", "face", null], default: null },
     deviceEventId: { type: String },
@@ -86,7 +91,8 @@ attendanceSchema.statics.getMemberAttendanceStats = async function(memberId, sta
   const records = await this.find({
     member: memberId,
     date: { $gte: startDate, $lte: endDate },
-    deletedAt: null
+    deletedAt: null,
+    membershipValidAtEvent: { $ne: false }
   });
 
   const totalDays = records.length;

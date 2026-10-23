@@ -1,12 +1,14 @@
 const Payment = require("../models/payment.model");
 const Notification = require("../models/notification.model");
 const Member = require("../models/member.model");
+const Plan = require("../models/plan.model");
 const User = require("../models/user.model");
 const { asyncHandler } = require("../utils/asyncHandler");
 const { sendResponse } = require("../utils/response");
 const { getPagination } = require("../utils/pagination");
 const invoiceDeliveryService = require("../services/invoiceDelivery.service");
 const { resolveBusinessStatusMemberIds } = require("../services/paymentStatusFilter.service");
+const { canActivateMembership } = require("../utils/membership");
 const mongoose = require("mongoose");
 const PDFDocument = require("pdfkit");
 
@@ -79,6 +81,8 @@ const createPayment = asyncHandler(async (req, res) => {
   const memberQuery = { _id: memberId, gymId, ...(scopedBranch ? { branchCode: scopedBranch } : {}) };
   const scopedMember = await Member.findOne(memberQuery);
   if (!scopedMember) throw Object.assign(new Error("Member not found in your branch"), { statusCode: 404 });
+  const referencedPlan = await Plan.findOne({ _id: planId, gymId });
+  if (!referencedPlan) throw Object.assign(new Error("Plan not found in your gym"), { statusCode: 404 });
   // Trainer isolation: trainers may only create payments for their assigned members.
   if (req.user.role === "trainer") {
     if (!scopedMember.trainer || String(scopedMember.trainer) !== String(req.user._id)) {
@@ -116,7 +120,7 @@ const createPayment = asyncHandler(async (req, res) => {
       const effectiveStatus = status !== undefined ? status : existingTermPayment.status;
       if (effectiveStatus === "paid") {
         scopedMember.paymentStatus = "paid";
-        if (scopedMember.membershipExpiryDate && new Date() < new Date(scopedMember.membershipExpiryDate)) {
+        if (await canActivateMembership(scopedMember, gymId)) {
           scopedMember.status = "active";
           scopedMember.isActivePlan = true;
         }
@@ -165,7 +169,7 @@ const createPayment = asyncHandler(async (req, res) => {
   if (member) {
     if (status === "paid") {
       member.paymentStatus = "paid";
-      if (member.membershipExpiryDate && new Date() < new Date(member.membershipExpiryDate)) {
+      if (await canActivateMembership(member, gymId)) {
         member.status = "active";
         member.isActivePlan = true;
       }
@@ -663,7 +667,7 @@ const markAsPaid = asyncHandler(async (req, res) => {
   const member = await Member.findOne({ _id: payment.member, gymId: req.gymId });
   if (member) {
     member.paymentStatus = "paid";
-    if (member.membershipExpiryDate && new Date() < new Date(member.membershipExpiryDate)) {
+    if (await canActivateMembership(member, req.gymId)) {
       member.status = "active";
       member.isActivePlan = true;
     }

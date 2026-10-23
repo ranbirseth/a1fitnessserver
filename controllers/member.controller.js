@@ -14,6 +14,26 @@ const { asyncHandler } = require("../utils/asyncHandler");
 const { sendResponse } = require("../utils/response");
 const { getPagination } = require("../utils/pagination");
 const { enforceBranchOwnership } = require("../middlewares/branchScope.middleware");
+const { isMembershipTermActiveAt } = require("../utils/membership");
+
+// Membership eligibility fields are derived server-side from a validated plan
+// and term. They must never be writable through a generic member update.
+const PROTECTED_MEMBER_UPDATE_FIELDS = [
+  "currentPlan",
+  "membershipStartDate",
+  "membershipExpiryDate",
+  "isActivePlan",
+  "paymentStatus",
+  "remainingDays",
+  "frozenAt"
+];
+
+const stripProtectedMemberFields = (payload) => {
+  for (const field of PROTECTED_MEMBER_UPDATE_FIELDS) {
+    delete payload[field];
+  }
+  return payload;
+};
 
 // ── Trainer assignment guard ──────────────────────────────────────────────
 // For the Trainer role, member access MUST be restricted to ONLY the members
@@ -232,9 +252,11 @@ const runMembershipPaymentOp = async (req, res, operationType, computeTerms) => 
     if (paymentData.status === "paid") {
       // Mirror createPayment / markAsPaid activation rules exactly.
       member.paymentStatus = "paid";
-      if (member.membershipExpiryDate && new Date() < new Date(member.membershipExpiryDate)) {
+      if (isMembershipTermActiveAt(startDate, expiryDate)) {
         member.status = "active";
         member.isActivePlan = true;
+      } else {
+        member.isActivePlan = false;
       }
     } else {
       member.paymentStatus = "pending";
@@ -408,9 +430,11 @@ const createMember = asyncHandler(async (req, res) => {
       // Mirror runMembershipPaymentOp / createPayment activation rules exactly.
       if (paymentData.status === "paid") {
         member.paymentStatus = "paid";
-        if (new Date() < new Date(expiryDate)) {
+        if (isMembershipTermActiveAt(startDate, expiryDate)) {
           member.status = "active";
           member.isActivePlan = true;
+        } else {
+          member.isActivePlan = false;
         }
       } else {
         member.paymentStatus = "pending";
@@ -629,6 +653,7 @@ const updateMember = asyncHandler(async (req, res) => {
     assertTrainerAssignment(req, member);
 
     const { name, phone, email, password, reason, trainerId, branchCode, ...memberPayload } = req.body;
+    stripProtectedMemberFields(memberPayload);
     
     // Only superadmin can reassign a member's branch
     if (req.user.role === "superadmin" && branchCode) {
@@ -756,7 +781,8 @@ const renewPlan = asyncHandler(async (req, res) => {
     if (requestedStartDate) {
       startDate = new Date(requestedStartDate);
     } else {
-      const isCurrentlyActive = member.status === "active" && member.membershipExpiryDate && new Date() < new Date(member.membershipExpiryDate);
+      const isCurrentlyActive = member.status === "active" && member.membershipStartDate && member.membershipExpiryDate &&
+        isMembershipTermActiveAt(member.membershipStartDate, member.membershipExpiryDate);
       startDate = isCurrentlyActive ? new Date(member.membershipExpiryDate) : new Date();
     }
     return { startDate, expiryDate: calculateExpiry(startDate, plan.duration) };
@@ -937,5 +963,7 @@ module.exports = {
   updateMyProfile,
   // Exported for unit tests (pure, non-DB helpers).
   memberMatchesTerm,
-  classifyDuplicateKey
+  classifyDuplicateKey,
+  stripProtectedMemberFields,
+  PROTECTED_MEMBER_UPDATE_FIELDS
 };

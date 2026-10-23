@@ -1,3 +1,5 @@
+const { fromZonedTime } = require("date-fns-tz");
+
 const DEFAULT_TIMEZONE = process.env.TIMEZONE || "Asia/Kolkata";
 
 function formatDateInTimezone(dateInput, timezone = DEFAULT_TIMEZONE) {
@@ -17,4 +19,15 @@ function formatDateInTimezone(dateInput, timezone = DEFAULT_TIMEZONE) {
 
 const getTodayDate = (timezone = DEFAULT_TIMEZONE) => formatDateInTimezone(new Date(), timezone);
 
-module.exports = { getTodayDate, formatDateInTimezone, DEFAULT_TIMEZONE };
+const getStartOfDayInTimezone = (dateInput = new Date(), timezone = DEFAULT_TIMEZONE) => {
+  const day = formatDateInTimezone(dateInput, timezone);
+  return fromZonedTime(`${day}T00:00:00`, timezone);
+};
+
+const getNoonInTimezone = (dateInput, timezone = DEFAULT_TIMEZONE) => {
+  const isDateOnly = typeof dateInput === "string" && /^\d{4}-\d{2}-\d{2}$/.test(dateInput);
+  const day = isDateOnly ? dateInput : formatDateInTimezone(dateInput, timezone);
+  return fromZonedTime(`${day}T12:00:00`, timezone);
+};
+
+module.exports = { getTodayDate, formatDateInTimezone, getStartOfDayInTimezone, getNoonInTimezone, DEFAULT_TIMEZONE };

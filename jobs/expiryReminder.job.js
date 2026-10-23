@@ -2,16 +2,20 @@ const cron = require("node-cron");
 const Member = require("../models/member.model");
 const Notification = require("../models/notification.model");
 const { sendRenewalReminders } = require("../services/reminder.service");
+const { getStartOfDayInTimezone } = require("../utils/date");
 
 const startExpiryReminderJob = () => {
   // Run every hour to check for expirations
   cron.schedule("0 * * * *", async () => {
     const now = new Date();
 
-    // 1. Mark expired memberships
+    // 1. Mark expired memberships. Expiry is a calendar date in the gym
+    // timezone and remains valid for the whole day, so only terms whose expiry
+    // day is already over are expired here.
+    const startOfToday = getStartOfDayInTimezone(now);
     const expiredMembers = await Member.updateMany(
       {
-        membershipExpiryDate: { $lt: now },
+        membershipExpiryDate: { $lt: startOfToday },
         status: "active"
       },
       {

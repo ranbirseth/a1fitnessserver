@@ -22,7 +22,12 @@ router.post("/mark", protectOptional, markAttendance);
 
 router.use(protect, branchScope);
 
-router.post("/check-in", authorize("member"), checkPlanAccess, memberCheckIn);
+router.post(
+  "/check-in",
+  authorize("member", "admin", "trainer"),
+  checkPlanAccess,
+  (req, res, next) => (req.user.role === "member" ? memberCheckIn(req, res, next) : checkIn(req, res, next))
+);
 router.post("/check-out", authorize("member"), checkPlanAccess, memberCheckOut);
 router.get("/me", authorize("member"), checkPlanAccess, getMyAttendance);
 router.get("/me/today", authorize("member"), checkPlanAccess, getTodayStatus);
@@ -32,7 +37,6 @@ router.get("/me/realtime", authorize("member"), checkPlanAccess, getRealTimeStat
 
 router.get("/", authorize("admin", "trainer"), history);
 router.post("/face-verify", authorize("admin", "trainer"), faceVerifyPlaceholder);
-router.post("/check-in", authorize("admin", "trainer"), checkIn);
 router.patch("/check-out/:id", authorize("admin", "trainer"), checkOut);
 router.put("/:id", authorize("admin", "superadmin"), updateAttendance);
 router.delete("/:id", authorize("admin", "superadmin"), deleteAttendance);

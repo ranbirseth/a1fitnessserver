@@ -1,12 +1,14 @@
 const Attendance = require("../models/attendance.model");
 const Member = require("../models/member.model");
 const ScannerEvent = require("../models/scannerEvent.model");
-const { getEligibilityIssue } = require("../utils/membership");
+const { getMembershipEligibility } = require("../utils/membership");
 const { formatDateInTimezone, DEFAULT_TIMEZONE } = require("../utils/date");
 const { normalizeUserId } = require("../utils/admsParser");
 const { emitToGym } = require("./realtime.service");
+const { issueDoorAuthorization } = require("./doorAuthorization.service");
 
 const LATE_THRESHOLD_HOUR = 9;
+const MAX_FUTURE_EVENT_SKEW_MS = 5 * 60 * 1000;
 
 const DEVICE_EVENT_ID = "deviceEventId";
 
@@ -121,6 +123,8 @@ const push = (attendance, action, eventTime, member, scanner, eventType, deviceE
   attendance.scanner = scanner._id;
   attendance.eventType = eventType;
   attendance.deviceEventId = deviceEventId;
+  attendance.membershipValidAtEvent = true;
+  attendance.membershipValidatedAt = new Date();
   return attendance;
 };
 
@@ -129,15 +133,38 @@ function consolidate(created) {
   return null;
 }
 
+async function issueAuthorizationSafely({ scanner, member, attendance, scannerEvent }) {
+  try {
+    return await issueDoorAuthorization({ scanner, member, attendance, scannerEvent });
+  } catch (err) {
+    const message = err && err.message ? err.message : "authorization persistence failed";
+    if (scanner && typeof scanner.logError === "function") {
+      const logResult = scanner.logError(`Door authorization not issued: ${message}`, "error");
+      if (logResult && typeof logResult.catch === "function") await logResult.catch(() => {});
+    }
+    return null;
+  }
+}
+
 async function processScannerEvent({ scanner, event }) {
   const gymId = scanner.gymId;
-  const eventTime = event.timestamp ? new Date(event.timestamp) : new Date();
+  const hasProvidedTimestamp = event.timestamp !== undefined && event.timestamp !== null && event.timestamp !== "";
+  const parsedEventTime = hasProvidedTimestamp ? new Date(event.timestamp) : new Date();
+  const timestampIsValid = parsedEventTime instanceof Date && !Number.isNaN(parsedEventTime.getTime());
+  const eventTime = timestampIsValid ? parsedEventTime : new Date();
   const eventType = event.eventType || "fingerprint";
-  const deviceEventId = event.deviceEventId || `${scanner.deviceId}:${new Date(eventTime).getTime()}`;
+  const deviceEventId = event.deviceEventId || `${scanner.deviceId}:${eventTime.getTime()}`;
+  const timezone = scanner.deviceTimezone || DEFAULT_TIMEZONE;
   const raw = event || {};
 
   const existingEvent = await ScannerEvent.findOne({ deviceEventId });
   if (existingEvent) return { status: "duplicate", id: existingEvent._id };
+
+  if (!timestampIsValid || eventTime.getTime() - Date.now() > MAX_FUTURE_EVENT_SKEW_MS) {
+    const created = await logScannerEvent({ scanner, event, eventType, decision: "deny", reason: "invalid_timestamp", deviceEventId, timestamp: eventTime });
+    if (!consolidate(created)) return { status: "duplicate", id: null };
+    return { status: "denied", reason: "invalid_timestamp", id: createScannerEventId(created) };
+  }
 
   const verified = event.verified !== false && event.decision !== "deny";
 
@@ -163,15 +190,15 @@ async function processScannerEvent({ scanner, event }) {
     return { status: "denied", reason: "branch_mismatch", id: createScannerEventId(created) };
   }
 
-  const issue = getEligibilityIssue(member);
-  if (issue) {
-    const created = await logScannerEvent({ scanner, member, event, eventType, decision: "deny", reason: issue, deviceEventId, timestamp: eventTime });
+  const eligibility = await getMembershipEligibility(member, eventTime, { timezone });
+  if (!eligibility.eligible) {
+    const created = await logScannerEvent({ scanner, member, event, eventType, decision: "deny", reason: eligibility.reason, deviceEventId, timestamp: eventTime });
     if (!consolidate(created)) return { status: "duplicate", id: null };
-    return { status: "denied", reason: issue, id: createScannerEventId(created) };
+    return { status: "denied", reason: eligibility.reason, id: createScannerEventId(created) };
   }
 
-  const today = formatDateInTimezone(eventTime);
-  const hour = getHourInTimeZone(eventTime);
+  const today = formatDateInTimezone(eventTime, timezone);
+  const hour = getHourInTimeZone(eventTime, timezone);
   const isLate = hour >= LATE_THRESHOLD_HOUR;
 
   let attendance = await Attendance.findOne({ gymId, member: member._id, date: today, deletedAt: null });
@@ -187,8 +214,10 @@ async function processScannerEvent({ scanner, event }) {
     push(attendance, "check-out", eventTime, member, scanner, eventType, deviceEventId);
     await attendance.save();
     const created = await logScannerEvent({ scanner, member, attendance, event, eventType, decision: "allow", reason: "checkout", deviceEventId, timestamp: eventTime });
+    if (!consolidate(created)) return { status: "duplicate", id: null };
+    const authorization = await issueAuthorizationSafely({ scanner, member, attendance, scannerEvent: created.doc });
     emitAttendanceUpdate({ scanner, member, attendance, decision: "allow", reason: "checkout", eventType });
-    return { status: "checkout", id: createScannerEventId(created) };
+    return { status: "checkout", id: createScannerEventId(created), authorization };
   }
 
   if (attendance && !attendance.checkIn) {
@@ -197,8 +226,10 @@ async function processScannerEvent({ scanner, event }) {
     push(attendance, "check-in", eventTime, member, scanner, eventType, deviceEventId);
     await attendance.save();
     const created = await logScannerEvent({ scanner, member, attendance, event, eventType, decision: "allow", reason: "verified", deviceEventId, timestamp: eventTime });
+    if (!consolidate(created)) return { status: "duplicate", id: null };
+    const authorization = await issueAuthorizationSafely({ scanner, member, attendance, scannerEvent: created.doc });
     emitAttendanceUpdate({ scanner, member, attendance, decision: "allow", reason: "verified", eventType });
-    return { status: "checkin", id: createScannerEventId(created) };
+    return { status: "checkin", id: createScannerEventId(created), authorization };
   }
 
   let newAttendance;
@@ -214,7 +245,9 @@ async function processScannerEvent({ scanner, event }) {
       scanner: scanner._id,
       eventType,
       deviceEventId,
-      timezone: scanner.deviceTimezone || DEFAULT_TIMEZONE,
+      timezone,
+      membershipValidAtEvent: true,
+      membershipValidatedAt: new Date(),
       auditLogs: [{
         action: "check-in",
         performedBy: member.user,
@@ -233,8 +266,10 @@ async function processScannerEvent({ scanner, event }) {
   }
 
   const created = await logScannerEvent({ scanner, member, attendance: newAttendance, event, eventType, decision: "allow", reason: "verified", deviceEventId, timestamp: eventTime });
+  if (!consolidate(created)) return { status: "duplicate", id: null };
+  const authorization = await issueAuthorizationSafely({ scanner, member, attendance: newAttendance, scannerEvent: created.doc });
   emitAttendanceUpdate({ scanner, member, attendance: newAttendance, decision: "allow", reason: "verified", eventType });
-  return { status: "checkin", id: createScannerEventId(created) };
+  return { status: "checkin", id: createScannerEventId(created), authorization };
 }
 
 function createScannerEventId(created) {
