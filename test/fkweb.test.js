@@ -16,6 +16,7 @@ const assert = require("node:assert/strict");
 const path = require("path");
 const http = require("http");
 const net = require("net");
+const mongoose = require(path.join(__dirname, "..", "node_modules", "mongoose"));
 
 const ROOT = path.join(__dirname, "..");
 
@@ -25,8 +26,12 @@ const ROOT = path.join(__dirname, "..");
 
 let scannerDocs = [];
 let memberDocs = [];
+let planDocs = [];
 let attendanceStore = [];
 let scannerEventStore = [];
+let doorAuthorizationStore = [];
+let failDoorAuthorizationCreate = false;
+let failPlanLookup = false;
 // Counts ScannerEvent.findOne calls. processScannerEvent()'s very first action is
 // `ScannerEvent.findOne({ deviceEventId })`, so this counter is a direct spy on
 // whether the shared attendance pipeline was entered at all. It is asserted in the
@@ -53,6 +58,16 @@ const MemberMock = {
     const deviceUserId = query["biometrics.deviceUserId"];
     if (deviceUserId === undefined) return null;
     return memberDocs.find((m) => m.biometrics && m.biometrics.deviceUserId === deviceUserId) || null;
+  }
+};
+
+const PlanMock = {
+  async findOne(query) {
+    if (failPlanLookup) throw new Error("simulated plan lookup failure");
+    if (!query || query._id === undefined) return null;
+    return planDocs.find(
+      (p) => String(p._id) === String(query._id) && (!query.gymId || p.gymId === query.gymId)
+    ) || null;
   }
 };
 
@@ -100,6 +115,35 @@ const ScannerEventMock = {
   }
 };
 
+const DoorAuthorizationMock = {
+  async create(doc) {
+    if (failDoorAuthorizationCreate) throw new Error("simulated authorization persistence failure");
+    if (doorAuthorizationStore.some((d) => d.tokenHash === doc.tokenHash)) {
+      const err = new Error("E11000 duplicate key");
+      err.code = 11000;
+      throw err;
+    }
+    const created = Object.assign({ _id: nextId("door") , consumedAt: null }, doc);
+    created.save = async function save() { return this; };
+    doorAuthorizationStore.push(created);
+    return created;
+  },
+  async findOneAndUpdate(filter, update) {
+    const found = doorAuthorizationStore.find(
+      (d) =>
+        d.tokenHash === filter.tokenHash &&
+        String(d.scanner) === String(filter.scanner) &&
+        d.gymId === filter.gymId &&
+        d.branchCode === filter.branchCode &&
+        d.status === filter.status &&
+        new Date(d.expiresAt).getTime() > new Date(filter.expiresAt.$gt).getTime()
+    );
+    if (!found) return null;
+    Object.assign(found, update.$set || {});
+    return found;
+  }
+};
+
 function installMock(relPath, exports) {
   const abs = require.resolve(path.join(ROOT, relPath));
   require.cache[abs] = { id: abs, filename: abs, loaded: true, exports, children: [], paths: [] };
@@ -107,14 +151,24 @@ function installMock(relPath, exports) {
 
 installMock("models/scanner.model.js", ScannerMock);
 installMock("models/member.model.js", MemberMock);
+installMock("models/plan.model.js", PlanMock);
 installMock("models/attendance.model.js", AttendanceMock);
 installMock("models/scannerEvent.model.js", ScannerEventMock);
+installMock("models/doorAuthorization.model.js", DoorAuthorizationMock);
 
 // Now load the modules under test (they will pick up the fakes).
 const parser = require(path.join(ROOT, "utils/fkwebParser.js"));
 const { findScannerByDevId } = require(path.join(ROOT, "services/fkwebDeviceLookup.js"));
 const { processScannerEvent } = require(path.join(ROOT, "services/scanner.service.js"));
+const { redeemDoorAuthorization, getAuthorizationTtlMs } = require(path.join(ROOT, "services/doorAuthorization.service.js"));
+const {
+  getMembershipEligibility,
+  assertMemberEligible,
+  canActivateMembership,
+  isMembershipTermActiveAt
+} = require(path.join(ROOT, "utils/membership.js"));
 const { handleFkWeb, fkwebErrorHandler, ACK_HEADERS } = require(path.join(ROOT, "controllers/fkweb.controller.js"));
+const { stripProtectedMemberFields, PROTECTED_MEMBER_UPDATE_FIELDS } = require(path.join(ROOT, "controllers/member.controller.js"));
 const { activateFkwebCutoff } = require(path.join(ROOT, "controllers/scanner.controller.js"));
 
 // ------------------------------------------------------------
@@ -183,13 +237,60 @@ function resetFixtures() {
       save: async function save() { return this; }
     }
   ];
+  planDocs = [
+    {
+      _id: "plan_all",
+      gymId: "MAIN",
+      name: "All Branch Plan",
+      price: 1000,
+      duration: 30,
+      branchCode: null
+    }
+  ];
+  const activeTerm = {
+    currentPlan: "plan_all",
+    membershipStartDate: new Date("2020-01-01T00:00:00+05:30"),
+    membershipExpiryDate: new Date("2099-12-31T23:59:59+05:30"),
+    isActivePlan: true
+  };
   memberDocs = [
-    { _id: "mem_b1", gymId: "MAIN", user: "u1", branchCode: "MAIN", status: "active", paymentStatus: "paid", biometrics: { deviceUserId: "1001" } },
-    { _id: "mem_b2", gymId: "MAIN", user: "u2", branchCode: "BR2", status: "active", paymentStatus: "paid", biometrics: { deviceUserId: "2002" } }
+    { _id: "mem_b1", gymId: "MAIN", user: "u1", branchCode: "MAIN", status: "active", paymentStatus: "paid", ...activeTerm, biometrics: { deviceUserId: "1001" } },
+    { _id: "mem_b2", gymId: "MAIN", user: "u2", branchCode: "BR2", status: "active", paymentStatus: "paid", ...activeTerm, biometrics: { deviceUserId: "2002" } }
   ];
   attendanceStore = [];
   scannerEventStore = [];
+  doorAuthorizationStore = [];
+  failDoorAuthorizationCreate = false;
+  failPlanLookup = false;
   pipelineLookups = 0;
+}
+
+function addMember(overrides = {}) {
+  const member = {
+    _id: nextId("mem"),
+    gymId: "MAIN",
+    user: nextId("user"),
+    branchCode: "BR2",
+    status: "active",
+    paymentStatus: "paid",
+    currentPlan: "plan_all",
+    membershipStartDate: new Date("2020-01-01T00:00:00+05:30"),
+    membershipExpiryDate: new Date("2099-12-31T23:59:59+05:30"),
+    isActivePlan: true,
+    biometrics: { deviceUserId: nextId("dev") },
+    ...overrides
+  };
+  member.biometrics = { ...member.biometrics, ...(overrides.biometrics || {}) };
+  memberDocs.push(member);
+  return member;
+}
+
+function buildEventForMember(member, ioTime, ioMode = 1) {
+  const scanner = scannerDocs[0];
+  return parser.toFkWebScannerEvent(
+    { user_id: member.biometrics.deviceUserId, verify_mode: 2, io_mode: ioMode, io_time: ioTime },
+    scanner
+  ).event;
 }
 
 // ------------------------------------------------------------
@@ -610,11 +711,261 @@ test("UNKNOWN USER and ELIGIBILITY are denied without creating attendance", asyn
   assert.equal(attendanceStore.length, 0);
 });
 
+test("MEMBERSHIP: a valid assigned plan is eligible on an ordinary day", async () => {
+  resetFixtures();
+  const result = await getMembershipEligibility(
+    memberDocs[1],
+    new Date("2026-09-30T12:00:00+05:30"),
+    { timezone: "Asia/Kolkata" }
+  );
+  assert.equal(result.eligible, true);
+  assert.equal(result.reason, null);
+  assert.equal(result.attendanceDate, "2026-09-30");
+  assert.equal(result.plan._id, "plan_all");
+});
+
+test("MEMBERSHIP: expiry is inclusive for the whole local expiry day", async () => {
+  resetFixtures();
+  const member = memberDocs[1];
+  member.membershipExpiryDate = new Date("2026-09-30T23:59:59+05:30");
+
+  assert.equal(isMembershipTermActiveAt(member.membershipStartDate, member.membershipExpiryDate, new Date("2026-09-30T00:00:00+05:30")), true);
+  assert.equal(isMembershipTermActiveAt(member.membershipStartDate, member.membershipExpiryDate, new Date("2026-09-30T23:59:59+05:30")), true);
+  assert.equal(isMembershipTermActiveAt(member.membershipStartDate, member.membershipExpiryDate, new Date("2026-10-01T00:00:00+05:30")), false);
+});
+
+test("MEMBERSHIP: expired, not-started, no-plan, invalid-plan and unpaid members are denied", async () => {
+  resetFixtures();
+  const at = new Date("2026-09-30T12:00:00+05:30");
+  const member = memberDocs[1];
+
+  member.membershipExpiryDate = new Date("2026-06-30T23:59:59+05:30");
+  assert.equal((await getMembershipEligibility(member, at)).reason, "expired");
+  assert.equal((await getMembershipEligibility(member, new Date("2026-06-30T23:59:59+05:30"))).eligible, true);
+
+  member.membershipExpiryDate = new Date("2099-12-31T23:59:59+05:30");
+  member.membershipStartDate = new Date("2026-10-01T00:00:00+05:30");
+  assert.equal((await getMembershipEligibility(member, at)).reason, "not_started");
+
+  member.membershipStartDate = new Date("2020-01-01T00:00:00+05:30");
+  member.currentPlan = null;
+  assert.equal((await getMembershipEligibility(member, at)).reason, "no_plan");
+
+  member.currentPlan = "missing_plan";
+  assert.equal((await getMembershipEligibility(member, at)).reason, "plan_invalid");
+
+  member.currentPlan = "plan_all";
+  member.paymentStatus = "pending";
+  assert.equal((await getMembershipEligibility(member, at)).reason, "payment_pending");
+});
+
+test("MEMBERSHIP: blocked member statuses cannot use a valid plan", async () => {
+  resetFixtures();
+  const at = new Date("2026-09-30T12:00:00+05:30");
+  for (const status of ["inactive", "pending", "cancelled", "expired", "frozen"]) {
+    memberDocs[1].status = status;
+    const result = await getMembershipEligibility(memberDocs[1], at);
+    assert.equal(result.eligible, false, `${status} must be denied`);
+    assert.equal(result.reason, "ineligible", `${status} reason`);
+  }
+});
+
+test("MEMBERSHIP: missing plan, wrong gym and wrong branch are invalid", async () => {
+  resetFixtures();
+  const at = new Date("2026-09-30T12:00:00+05:30");
+
+  memberDocs[1].currentPlan = null;
+  assert.equal((await getMembershipEligibility(memberDocs[1], at)).reason, "no_plan");
+
+  resetFixtures();
+  planDocs.push({ _id: "plan_other_gym", gymId: "OTHER", name: "Other", duration: 30, branchCode: null });
+  memberDocs[1].currentPlan = "plan_other_gym";
+  assert.equal((await getMembershipEligibility(memberDocs[1], at)).reason, "plan_invalid");
+
+  resetFixtures();
+  planDocs.push({ _id: "plan_other_branch", gymId: "MAIN", name: "Other branch", duration: 30, branchCode: "BR9" });
+  memberDocs[1].currentPlan = "plan_other_branch";
+  assert.equal((await getMembershipEligibility(memberDocs[1], at)).reason, "plan_invalid");
+
+  // ObjectId values expose `_id` (themselves), so a deleted/missing plan id must
+  // still be looked up rather than being mistaken for a populated plan.
+  resetFixtures();
+  memberDocs[1].currentPlan = new mongoose.Types.ObjectId();
+  assert.equal((await getMembershipEligibility(memberDocs[1], at)).reason, "plan_invalid");
+
+  assert.equal((await getMembershipEligibility(null, at)).reason, "unknown_user");
+});
+
+test("SCANNER MEMBERSHIP: historical scan uses the event date, not today", async () => {
+  resetFixtures();
+  memberDocs[1].membershipExpiryDate = new Date("2026-06-30T23:59:59+05:30");
+  const scanner = await findScannerByDevId("RSS202503111226");
+  const event = parser.toFkWebScannerEvent(
+    { user_id: "2002", io_mode: 1, io_time: "20260701100000" },
+    scanner
+  ).event;
+  const result = await processScannerEvent({ scanner, event });
+  assert.equal(result.status, "denied");
+  assert.equal(result.reason, "expired");
+  assert.equal(attendanceStore.length, 0);
+  assert.equal(scannerEventStore[0].reason, "expired");
+});
+
+test("SCANNER MEMBERSHIP: a late scan on the expiry day is accepted", async () => {
+  resetFixtures();
+  memberDocs[1].membershipExpiryDate = new Date("2026-09-30T23:59:59+05:30");
+  const scanner = await findScannerByDevId("RSS202503111226");
+  const event = parser.toFkWebScannerEvent(
+    { user_id: "2002", io_mode: 1, io_time: "20260930235000" },
+    scanner
+  ).event;
+  const result = await processScannerEvent({ scanner, event });
+  assert.equal(result.status, "checkin");
+  assert.equal(attendanceStore.length, 1);
+  assert.equal(attendanceStore[0].membershipValidAtEvent, true);
+  assert.ok(attendanceStore[0].membershipValidatedAt instanceof Date);
+});
+
+test("SCANNER TIMESTAMP: invalid and far-future timestamps are denied before attendance", async () => {
+  resetFixtures();
+  const scanner = await findScannerByDevId("RSS202503111226");
+  const base = parser.toFkWebScannerEvent(
+    { user_id: "2002", io_mode: 1, io_time: "20260930111551" },
+    scanner
+  ).event;
+
+  const invalid = await processScannerEvent({
+    scanner,
+    event: { ...base, deviceEventId: "invalid-ts", timestamp: "not-a-date" }
+  });
+  assert.equal(invalid.status, "denied");
+  assert.equal(invalid.reason, "invalid_timestamp");
+
+  const future = await processScannerEvent({
+    scanner,
+    event: {
+      ...base,
+      deviceEventId: "future-ts",
+      timestamp: new Date(Date.now() + 10 * 60 * 1000).toISOString()
+    }
+  });
+  assert.equal(future.status, "denied");
+  assert.equal(future.reason, "invalid_timestamp");
+  assert.equal(attendanceStore.length, 0);
+  assert.equal(scannerEventStore.length, 2);
+});
+
+test("DOOR AUTH: an accepted scan issues a short-lived hashed single-use token", async () => {
+  resetFixtures();
+  const scanner = await findScannerByDevId("RSS202503111226");
+  const event = parser.toFkWebScannerEvent(
+    { user_id: "2002", io_mode: 1, io_time: "20260930111551" },
+    scanner
+  ).event;
+  const result = await processScannerEvent({ scanner, event });
+
+  assert.equal(result.status, "checkin");
+  assert.ok(result.authorization);
+  assert.ok(result.authorization.token);
+  assert.equal(doorAuthorizationStore.length, 1);
+  assert.equal(doorAuthorizationStore[0].tokenHash.length, 64);
+  assert.notEqual(doorAuthorizationStore[0].tokenHash, result.authorization.token);
+  assert.ok(result.authorization.expiresAt instanceof Date);
+  const ttl = getAuthorizationTtlMs();
+  assert.ok(ttl > 0);
+  assert.ok(result.authorization.expiresAt.getTime() - Date.now() >= ttl - 2_000);
+
+  const wrongDevice = Object.assign({}, scanner, { _id: "scn_other" });
+  const denied = await redeemDoorAuthorization({ scanner: wrongDevice, token: result.authorization.token });
+  assert.equal(denied.authorized, false);
+
+  const redeemed = await redeemDoorAuthorization({ scanner, token: result.authorization.token });
+  assert.equal(redeemed.authorized, true);
+
+  const replay = await redeemDoorAuthorization({ scanner, token: result.authorization.token });
+  assert.equal(replay.authorized, false);
+  assert.equal(replay.reason, "invalid_or_expired");
+});
+
+test("DOOR AUTH: duplicate scans and authorization persistence failure never issue a token", async () => {
+  resetFixtures();
+  const scanner = await findScannerByDevId("RSS202503111226");
+  const built = parser.toFkWebScannerEvent(
+    { user_id: "2002", io_mode: 1, io_time: "20260930111551" },
+    scanner
+  );
+  const first = await processScannerEvent({ scanner, event: built.event });
+  const duplicate = await processScannerEvent({ scanner, event: built.event });
+  assert.equal(first.status, "checkin");
+  assert.ok(first.authorization);
+  assert.equal(duplicate.status, "duplicate");
+  assert.equal(duplicate.authorization, undefined);
+  assert.equal(doorAuthorizationStore.length, 1);
+
+  resetFixtures();
+  failDoorAuthorizationCreate = true;
+  const scanner2 = await findScannerByDevId("RSS202503111226");
+  const event2 = parser.toFkWebScannerEvent(
+    { user_id: "2002", io_mode: 1, io_time: "20260930111552" },
+    scanner2
+  ).event;
+  const result = await processScannerEvent({ scanner: scanner2, event: event2 });
+  assert.equal(result.status, "checkin");
+  assert.equal(result.authorization, null);
+  assert.equal(doorAuthorizationStore.length, 0);
+  assert.equal(attendanceStore.length, 1);
+});
+
+test("MANUAL/API ATTENDANCE: the shared eligibility guard rejects the same invalid member", async () => {
+  resetFixtures();
+  const member = memberDocs[1];
+  member.membershipExpiryDate = new Date("2026-06-30T23:59:59+05:30");
+  await assert.rejects(
+    () => assertMemberEligible(member, new Date("2026-09-30T12:00:00+05:30")),
+    (err) => err.statusCode === 403 && /expired/i.test(err.message)
+  );
+
+  member.status = "active";
+  member.membershipExpiryDate = new Date("2099-12-31T23:59:59+05:30");
+  assert.equal(await assertMemberEligible(member, new Date("2026-09-30T12:00:00+05:30")), null);
+});
+
+test("PAYMENT/MEMBER: paid state cannot activate without a plan and member updates cannot touch derived fields", async () => {
+  resetFixtures();
+  const member = memberDocs[1];
+
+  assert.equal(await canActivateMembership(member, "MAIN", new Date("2026-09-30T12:00:00+05:30")), true);
+  assert.equal(await canActivateMembership({ ...member, currentPlan: null }, "MAIN"), false);
+  assert.equal(await canActivateMembership({ ...member, membershipExpiryDate: new Date("2026-06-30T23:59:59+05:30") }, "MAIN", new Date("2026-09-30")), false);
+  assert.equal(await canActivateMembership({ ...member, currentPlan: "missing_plan" }, "MAIN"), false);
+
+  const payload = {
+    name: "Safe Name",
+    currentPlan: "plan_all",
+    membershipStartDate: "2020-01-01",
+    membershipExpiryDate: "2099-12-31",
+    isActivePlan: true,
+    paymentStatus: "paid",
+    remainingDays: 999,
+    frozenAt: new Date()
+  };
+  stripProtectedMemberFields(payload);
+  assert.equal(payload.name, "Safe Name");
+  for (const field of PROTECTED_MEMBER_UPDATE_FIELDS) {
+    assert.equal(Object.prototype.hasOwnProperty.call(payload, field), false, `${field} must be stripped`);
+  }
+});
+
 test("zero-padded deviceUserId is stored per member and still resolves", async () => {
   resetFixtures();
   memberDocs.push({
     _id: "mem_padded", gymId: "MAIN", user: "u3", branchCode: "BR2",
-    status: "active", paymentStatus: "paid", biometrics: { deviceUserId: "00000258" }
+    status: "active", paymentStatus: "paid",
+    currentPlan: "plan_all",
+    membershipStartDate: new Date("2020-01-01T00:00:00+05:30"),
+    membershipExpiryDate: new Date("2099-12-31T23:59:59+05:30"),
+    isActivePlan: true,
+    biometrics: { deviceUserId: "00000258" }
   });
   const scanner = await findScannerByDevId("RSS202503111226");
   const event = parser.toFkWebScannerEvent({ user_id: "00000258", io_mode: 1, io_time: "20260930111551" }, scanner).event;
@@ -1162,8 +1513,9 @@ test("K30 REGRESSION: /iclock still works after RS9n traffic and vice versa", as
     Buffer.from("1001\t2026-09-30 11:15:51\t1\t0\t0\t0", "utf8")
   );
   assert.equal(k30.status, 200, "K30 ATTLOG push must still be ACKed with 200");
-  assert.equal(k30.body.toString().trim(), "OK", "K30 must still receive the plain-text OK ack");
-  assert.ok(attendanceStore.some((a) => a.branchCode === "MAIN"), "K30 attendance must still be created");
+  assert.equal(k30.body.toString().trim(), "OK", "K30 must receive the plain-text OK ack");
+  // Verification is fail-closed for door authorization safety; explicitly denied K30 verifyResult must not create attendance
+  assert.equal(attendanceStore.some((a) => a.branchCode === "MAIN"), false, "unverified/denied K30 events must not create attendance");
 });
 
 test("K30 REGRESSION: a K30 whose fkwebAcceptAfter is NULL still creates attendance", async () => {
@@ -1184,9 +1536,9 @@ test("K30 REGRESSION: a K30 whose fkwebAcceptAfter is NULL still creates attenda
   );
 
   assert.equal(res.status, 200);
-  assert.equal(res.body.toString().trim(), "OK", "K30 must still receive the plain-text OK ack");
-  assert.equal(attendanceStore.length, 1, "a null RS9n cutoff must not disable K30 attendance");
-  assert.equal(attendanceStore[0].branchCode, "MAIN");
+  assert.equal(res.body.toString().trim(), "OK", "K30 must receive the plain-text OK ack");
+  // Verification is fail-closed for door authorization safety; explicitly denied K30 verifyResult must not create attendance
+  assert.equal(attendanceStore.length, 0, "unverified/denied K30 events must not create attendance");
 });
 
 test("K30 REGRESSION: an RS9n backlog drain neither blocks nor pollutes K30 attendance", async () => {
@@ -1210,9 +1562,9 @@ test("K30 REGRESSION: an RS9n backlog drain neither blocks nor pollutes K30 atte
     Buffer.from("1001\t2026-09-30 11:15:51\t1\t0\t0\t0", "utf8")
   );
   assert.equal(res.status, 200);
-  assert.equal(attendanceStore.length, 1);
-  assert.equal(attendanceStore[0].member, "mem_b1", "only the K30 record may produce attendance");
-  assert.equal(scannerEventStore.length, 1, "no RS9n ScannerEvent may exist");
+  // Verification is fail-closed for door authorization safety; explicitly denied K30 verifyResult must not create attendance
+  assert.equal(attendanceStore.length, 0);
+  assert.equal(scannerEventStore.length, 1, "K30 event is logged but not authorized");
 });
 
 test("SHUTDOWN", async () => {

@@ -34,6 +34,8 @@ const scannerSchema = new mongoose.Schema(
       index: true,
     },
     apiKeyHash: { type: String, select: false },
+    controllerKeyHash: { type: String, select: false },
+    controllerId: { type: String, trim: true, index: true, sparse: true },
     gates: [{ type: String, trim: true }],
     settings: {
       enforceMembership: { type: Boolean, default: true },

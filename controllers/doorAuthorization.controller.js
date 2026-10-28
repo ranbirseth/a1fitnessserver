@@ -5,9 +5,10 @@ const { redeemDoorAuthorization } = require("../services/doorAuthorization.servi
 
 const redeem = asyncHandler(async (req, res) => {
   const scanner = req.scanner;
+  const controller = req.controller;
   const token = req.body && req.body.token;
 
-  const result = await redeemDoorAuthorization({ scanner, token });
+  const result = await redeemDoorAuthorization({ scanner, token, controller });
   if (!result.authorized) {
     throw new AppError("Door authorization is invalid, expired, or already used", 403);
   }

@@ -89,15 +89,59 @@ function makeDeviceEventId(scanner, record) {
   ].join(":");
 }
 
+function isK30VerificationSuccessful(record) {
+  if (!record) return false;
+
+  const verifyResult = record.verifyResult;
+  let hasExplicitVerifyResult = false;
+  let verifyResultIndicatesSuccess = false;
+
+  if (verifyResult !== undefined && verifyResult !== null && String(verifyResult).trim() !== "") {
+    hasExplicitVerifyResult = true;
+    const vr = String(verifyResult).trim().toLowerCase();
+    // Be strict - only treat explicit success values as verified
+    if (vr === "1" || vr === "0x1" || vr === "true" || vr === "ok" || vr === "success" || vr === "match") {
+      verifyResultIndicatesSuccess = true;
+    } else if (vr === "0" || vr === "-1" || vr === "false" || vr === "fail" || vr === "failed" || vr === "no" || vr === "denied" || vr === "mismatch") {
+      return false;
+    } else {
+      // Unknown value - fail closed
+      return false;
+    }
+  }
+
+  const attState = record.attState;
+  if (attState !== undefined && attState !== null && String(attState).trim() !== "") {
+    const as = String(attState).trim();
+    // Common denied/invalid states - fail closed for unknown/denied
+    if (as === "255" || as === "0xFF" || as.toLowerCase() === "denied" || as.toLowerCase() === "fail") {
+      return false;
+    }
+    // For K30, we cannot safely assume success from attState alone without confirmed mapping
+    // Fail closed if we cannot positively confirm success
+  }
+
+  // If we have explicit verification fields and none confirm success, or if missing critical verification info
+  // and no trusted confirmation layer exists, fail closed for door authorization safety
+  if (!hasExplicitVerifyResult) {
+    // Missing verification result - cannot confirm successful authentication, fail closed
+    return false;
+  }
+
+  // Explicit verifyResult present and indicates success, and no explicit denial from attState
+  return verifyResultIndicatesSuccess;
+}
+
 function toScannerEvent(record, scanner) {
   if (!record || record.malformed || !record.timestamp || !record.userId) return null;
   const eventType = mapVerifyTypeToEventType(record.verifyType);
   const isCard = String(record.verifyType) === "2";
+  const verified = isK30VerificationSuccessful(record);
   const event = {
     userId: normalizeUserId(record.userId),
     rawUserId: String(record.userId).trim(),
     timestamp: record.timestamp,
-    verified: true,
+    verified,
     deviceEventId: makeDeviceEventId(scanner, record),
     eventType
   };
@@ -111,6 +155,7 @@ function toScannerEvent(record, scanner) {
 module.exports = {
   parseAttLog,
   toScannerEvent,
+  isK30VerificationSuccessful,
   mapVerifyTypeToEventType,
   parseAdmsDateTime,
   makeDeviceEventId,

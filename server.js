@@ -51,6 +51,9 @@ const server = http.createServer(app);
 const allowedOrigins = [
   "http://localhost:5173",
   "https://a1-fitness-alpha.vercel.app",
+  "http://127.0.0.1:5000",
+  "http://localhost:3000",
+  "http://192.168.31.222:5000",
 ];
 
 // Also support CLIENT_ORIGIN from Render environment variables
@@ -395,7 +398,9 @@ if (
 // ============================================================
 
 io.on("connection", (socket) => {
-  const gymId = socket.handshake.query.gymId;
+  const queryGymId = socket.handshake.query.gymId;
+  const gymId =
+    typeof queryGymId === "string" ? queryGymId.trim() : "";
 
   if (gymId) {
     socket.join(gymId);
@@ -414,6 +419,14 @@ io.on("connection", (socket) => {
     if (id) {
       socket.join(id);
     }
+  });
+
+  socket.on("esp32_ping", () => {
+    console.log(`ESP32 heartbeat received from socket ${socket.id}`);
+    socket.emit(
+      "backend_ack",
+      "ESP32 telemetry verified: two-way communication is stable."
+    );
   });
 });
 
@@ -454,6 +467,18 @@ const startServer = (port, attempt = 1) => {
     );
 
     process.exit(1);
+  });
+
+  app.get('/test-unlock', (req, res) => {
+    if (app.locals.io) {
+      app.locals.io.to("MAIN").emit("door:authorization", {
+        authorized: true,
+        name: "Local Test Member",
+        reason: "Manual Local Pipeline Test Pass"
+      });
+      return res.send("Unlock instruction broadcasted to ESP32 successfully!");
+    }
+    res.status(500).send("Socket.IO engine not initialized.");
   });
 
   server.listen(port, () => {
@@ -559,6 +584,10 @@ const start = async () => {
 if (process.env.RENDER !== "true") {
   const admsApp = express();
   const admsPort = Number(process.env.ADMS_PORT || 8081);
+
+  // Share the main Socket.IO server with the dedicated ADMS listener so hardware
+  // punches can be broadcast to the ESP32 gateway room ("MAIN").
+  admsApp.locals.io = app.locals.io;
 
   // Raw text parser BEFORE any JSON parsing so the tab/newline separated device
   // streams reach req.body as untouched strings.

@@ -166,7 +166,7 @@ async function processScannerEvent({ scanner, event }) {
     return { status: "denied", reason: "invalid_timestamp", id: createScannerEventId(created) };
   }
 
-  const verified = event.verified !== false && event.decision !== "deny";
+  const verified = event.verified === true && event.decision !== "deny";
 
   if (!verified) {
     const created = await logScannerEvent({ scanner, event, eventType, decision: "deny", reason: "not_matched", deviceEventId, timestamp: eventTime });
@@ -215,9 +215,9 @@ async function processScannerEvent({ scanner, event }) {
     await attendance.save();
     const created = await logScannerEvent({ scanner, member, attendance, event, eventType, decision: "allow", reason: "checkout", deviceEventId, timestamp: eventTime });
     if (!consolidate(created)) return { status: "duplicate", id: null };
-    const authorization = await issueAuthorizationSafely({ scanner, member, attendance, scannerEvent: created.doc });
+    // Do not issue door authorization on checkout events
     emitAttendanceUpdate({ scanner, member, attendance, decision: "allow", reason: "checkout", eventType });
-    return { status: "checkout", id: createScannerEventId(created), authorization };
+    return { status: "checkout", id: createScannerEventId(created) };
   }
 
   if (attendance && !attendance.checkIn) {
@@ -228,6 +228,15 @@ async function processScannerEvent({ scanner, event }) {
     const created = await logScannerEvent({ scanner, member, attendance, event, eventType, decision: "allow", reason: "verified", deviceEventId, timestamp: eventTime });
     if (!consolidate(created)) return { status: "duplicate", id: null };
     const authorization = await issueAuthorizationSafely({ scanner, member, attendance, scannerEvent: created.doc });
+    if (authorization) {
+      emitToGym(scanner.gymId, "door:authorization", {
+        token: authorization.token,
+        expiresAt: authorization.expiresAt,
+        scannerId: scanner.deviceId,
+        memberId: member._id.toString(),
+        attendanceId: attendance._id.toString()
+      });
+    }
     emitAttendanceUpdate({ scanner, member, attendance, decision: "allow", reason: "verified", eventType });
     return { status: "checkin", id: createScannerEventId(created), authorization };
   }
@@ -268,6 +277,15 @@ async function processScannerEvent({ scanner, event }) {
   const created = await logScannerEvent({ scanner, member, attendance: newAttendance, event, eventType, decision: "allow", reason: "verified", deviceEventId, timestamp: eventTime });
   if (!consolidate(created)) return { status: "duplicate", id: null };
   const authorization = await issueAuthorizationSafely({ scanner, member, attendance: newAttendance, scannerEvent: created.doc });
+  if (authorization) {
+    emitToGym(scanner.gymId, "door:authorization", {
+      token: authorization.token,
+      expiresAt: authorization.expiresAt,
+      scannerId: scanner.deviceId,
+      memberId: member._id.toString(),
+      attendanceId: newAttendance._id.toString()
+    });
+  }
   emitAttendanceUpdate({ scanner, member, attendance: newAttendance, decision: "allow", reason: "verified", eventType });
   return { status: "checkin", id: createScannerEventId(created), authorization };
 }

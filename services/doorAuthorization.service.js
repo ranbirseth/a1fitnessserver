@@ -48,29 +48,56 @@ async function issueDoorAuthorization({ scanner, member, attendance, scannerEven
 }
 
 /**
- * Atomically consumes a token. The query is bound to the authenticated scanner,
+ * Atomically consumes a token. The query is bound to the authenticated controller/scanner,
  * gym and branch; a token from another device cannot be redeemed. The
  * findOneAndUpdate is the replay barrier: only one caller can flip pending ->
  * consumed.
  */
-async function redeemDoorAuthorization({ scanner, token, now = new Date() }) {
-  if (!scanner || !scanner._id || !scanner.gymId || !token) {
+async function redeemDoorAuthorization({ scanner, token, controller, now = new Date() }) {
+  const authContext = controller || scanner;
+  if (!authContext || !authContext._id || !authContext.gymId || !token) {
+    return { authorized: false, reason: "invalid_request" };
+  }
+
+  const filter = {
+    tokenHash: hashToken(token),
+    gymId: authContext.gymId,
+    branchCode: authContext.branchCode || "MAIN",
+    status: "pending",
+    expiresAt: { $gt: now }
+  };
+
+  if (controller) {
+    // Controllers redeem grants; ensure strict binding to same gym/branch
+    // If controller has allowed scanner restrictions, enforce if present
+    if (Array.isArray(controller.allowedScanners) && controller.allowedScanners.length > 0) {
+      filter.scanner = { $in: controller.allowedScanners };
+    } else if (Array.isArray(controller.allowedScannerIds) && controller.allowedScannerIds.length > 0) {
+      filter.deviceId = { $in: controller.allowedScannerIds };
+    } else {
+      // No explicit allowed list - bind to the controller's own associated scanner/deviceId
+      // This handles DoorController model and Scanner fallback (where controllerId/deviceId identifies the controller)
+      if (controller._id) {
+        filter.scanner = controller._id;
+      }
+      if (controller.deviceId) {
+        filter.deviceId = controller.deviceId;
+      }
+    }
+  } else if (scanner) {
+    filter.scanner = scanner._id;
+  } else {
     return { authorized: false, reason: "invalid_request" };
   }
 
   const authorization = await DoorAuthorization.findOneAndUpdate(
-    {
-      tokenHash: hashToken(token),
-      scanner: scanner._id,
-      gymId: scanner.gymId,
-      branchCode: scanner.branchCode || "MAIN",
-      status: "pending",
-      expiresAt: { $gt: now }
-    },
+    filter,
     {
       $set: {
         status: "consumed",
-        consumedAt: now
+        consumedAt: now,
+        consumedByController: controller ? controller._id : undefined,
+        consumedByScanner: scanner && !controller ? scanner._id : (controller ? undefined : scanner?._id)
       }
     },
     { new: true }
@@ -78,6 +105,18 @@ async function redeemDoorAuthorization({ scanner, token, now = new Date() }) {
 
   if (!authorization) {
     return { authorized: false, reason: "invalid_or_expired" };
+  }
+
+  if (controller) {
+    if (
+      String(authorization.gymId) !== String(controller.gymId) ||
+      String(authorization.branchCode || "MAIN").toLowerCase() !== String(controller.branchCode || "MAIN").toLowerCase()
+    ) {
+      try {
+        await DoorAuthorization.updateOne({ _id: authorization._id, status: "consumed" }, { $set: { status: "pending" }, $unset: { consumedAt: 1, consumedByController: 1 } });
+      } catch (e) {}
+      return { authorized: false, reason: "invalid_or_expired" };
+    }
   }
 
   return {
