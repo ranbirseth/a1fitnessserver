@@ -127,7 +127,12 @@ app.options("*", cors(corsOptions));
 // ============================================================
 
 const io = new Server(server, {
-  cors: corsOptions,
+  cors: {
+    origin: true,
+    methods: ["GET", "POST"],
+    credentials: true,
+  },
+  transports: ["websocket", "polling"],
 });
 
 app.locals.io = io;
